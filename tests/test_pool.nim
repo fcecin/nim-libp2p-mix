@@ -4,7 +4,11 @@
 {.used.}
 
 import results, sequtils
-import libp2p/[crypto/crypto, crypto/secp, multiaddress, peerid, peerstore]
+import libp2p/[crypto/crypto, crypto/secp, multiaddress, peerid]
+# Exclude MixPubKeyBook to avoid the transitional ambiguity with the
+# version still shipped by registered libp2p; we use the one defined
+# in libp2p_mix/pool.
+import libp2p/peerstore except MixPubKeyBook
 import libp2p_mix/[mix_node, pool]
 import ./tools/unittest
 import ./tools/crypto

@@ -5,16 +5,12 @@
 
 import chronos, results, stew/byteutils, sequtils, tables
 import
-  libp2p/[
-    protocols/ping,
-    peerid,
-    peerstore,
-    multiaddress,
-    switch,
-    builders,
-    crypto/crypto,
-    crypto/secp,
-  ]
+  libp2p/
+    [protocols/ping, peerid, multiaddress, switch, builders, crypto/crypto, crypto/secp]
+# Exclude MixPubKeyBook to avoid the transitional ambiguity with the
+# version still shipped by registered libp2p; we use the one defined
+# in libp2p_mix/pool.
+import libp2p/peerstore except MixPubKeyBook
 import libp2p_mix
 import libp2p_mix/mix_protocol
 import libp2p_mix/sphinx
