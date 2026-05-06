@@ -8,10 +8,13 @@ description =
 license = "MIT"
 skipDirs = @["examples", "tests"]
 
-# nim-libp2p pinned to a master commit that includes `pick` utilities (PR #2245).
-# Bump as needed; downstream consumers should align their libp2p pin to match.
+# nim-libp2p pinned to the tip of the mix-deletion PR branch
+# (vacp2p/nim-libp2p#2378). That commit has `MixPubKeyBook` removed from
+# libp2p/peerstore — required so the local definition in libp2p_mix/pool
+# is unambiguous. Once #2378 merges to master and is published, replace
+# the pin with `libp2p >= <new-version>`.
 requires "nim >= 2.0.0",
-  "https://github.com/vacp2p/nim-libp2p.git#bd2d5a745de2844dc326e421b0cb1662541e0d6e",
+  "https://github.com/vacp2p/nim-libp2p.git#074fe1560bc8a413315e2f3d917a63f0ac12105f",
   "chronicles >= 0.11.0", "chronos >= 4.2.2", "metrics", "nimcrypto >= 0.6.0",
   "bearssl >= 0.2.7", "stew >= 0.4.2", "results", "unittest2"
 
