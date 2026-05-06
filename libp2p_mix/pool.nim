@@ -19,6 +19,11 @@ import ./multiaddr as mix_multiaddr
 
 export mix_node.MixPubInfo
 
+type MixPubKeyBook* = ref object of PeerBook[Curve25519Key]
+  ## Tracks Curve25519 mix public keys per peer. Defined here so the mix
+  ## package owns its peer-store extension and libp2p core stays free of
+  ## mix-specific types.
+
 func isSupportedMultiaddr(maddr: MultiAddress): bool =
   ## Returns true if the multiaddress is supported by the mix protocol.
   ## Mix protocol supports IPv4 addresses with TCP or QUIC-v1 transports,
