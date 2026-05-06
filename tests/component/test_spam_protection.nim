@@ -7,7 +7,7 @@ import chronos, results, stew/byteutils
 import libp2p/protocols/[protocol, ping]
 import libp2p_mix
 import libp2p_mix/delay_strategy
-import ../tools/[lifecycle, unittest]
+import ../tools/[lifecycle, unittest, crypto]
 import ../utils
 
 suite "Mix Protocol - Spam Protection":
@@ -29,7 +29,7 @@ suite "Mix Protocol - Spam Protection":
     )
     startAndDeferStop(nodes)
 
-    let (destNode, pingProto) = await setupDestNode(Ping.new())
+    let (destNode, pingProto) = await setupDestNode(Ping.new(rng = rng()))
     defer:
       await stopDestNode(destNode)
 
