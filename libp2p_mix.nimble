@@ -8,10 +8,15 @@ description =
 license = "MIT"
 skipDirs = @["examples", "tests"]
 
-# nim-libp2p pinned to a master commit that includes `pick` utilities (PR #2245).
-# Bump as needed; downstream consumers should align their libp2p pin to match.
+# nim-libp2p pinned to the master commit that merged the mix-extraction PR
+# (vacp2p/nim-libp2p#2378). That commit removes `MixPubKeyBook` from
+# libp2p/peerstore — required so the local definition in libp2p_mix/pool
+# is unambiguous. The newer libp2p adds a git-pinned boringssl dep that
+# trips nimble's default SAT solver, so the CI workflow uses
+# `--solver:legacy` for `nimble setup`. Once a release including #2378
+# is tagged, replace the pin with `libp2p >= <new-version>`.
 requires "nim >= 2.0.0",
-  "https://github.com/vacp2p/nim-libp2p.git#bd2d5a745de2844dc326e421b0cb1662541e0d6e",
+  "https://github.com/vacp2p/nim-libp2p.git#7e72c0d6df8dd9dbd2902915da332a109aaf7906",
   "chronicles >= 0.11.0", "chronos >= 4.2.2", "metrics", "nimcrypto >= 0.6.0",
   "bearssl >= 0.2.7", "stew >= 0.4.2", "results", "unittest2"
 
