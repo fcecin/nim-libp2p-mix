@@ -30,12 +30,10 @@ proc initMixNodeInfo*(
     libp2pPrivKey: libp2pPrivKey,
   )
 
-proc generateRandom*(
-    T: typedesc[MixNodeInfo], port: int, rng: ref HmacDrbgContext
-): MixNodeInfo =
+proc generateRandom*(T: typedesc[MixNodeInfo], port: int, rng: Rng): MixNodeInfo =
   let
     (mixPrivKey, mixPubKey) = generateKeyPair().expect("Generate key pair error")
-    keyPair = SkKeyPair.random(rng[])
+    keyPair = SkKeyPair.random(rng)
     pubKeyProto = PublicKey(scheme: Secp256k1, skkey: keyPair.pubkey)
 
   MixNodeInfo(
@@ -48,7 +46,7 @@ proc generateRandom*(
   )
 
 proc generateRandomMany*(
-    T: typedesc[MixNodeInfo], count: int, rng: ref HmacDrbgContext, basePort: int = 4242
+    T: typedesc[MixNodeInfo], count: int, rng: Rng, basePort: int = 4242
 ): seq[MixNodeInfo] =
   var nodeInfos = newSeq[MixNodeInfo](count)
   for i in 0 ..< count:

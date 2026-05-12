@@ -4,12 +4,12 @@
 ## Pluggable delay strategy interface for the Mix Protocol.
 
 import std/math
-import bearssl/rand
+import libp2p/crypto/crypto
 import ./delay
 export delay
 
 type DelayStrategy* = ref object of RootObj ## Abstract interface for delay strategies.
-  rng: ref HmacDrbgContext
+  rng: Rng
 
 method generateForEntry*(self: DelayStrategy): Delay {.base, gcsafe, raises: [].} =
   ## Generate delay value to encode in packet (called by sender/entry node).
@@ -26,12 +26,12 @@ method generateForIntermediate*(
 type NoSamplingDelayStrategy* = ref object of DelayStrategy
   ## Default strategy: generates random delays [0-2]ms, uses them directly.
 
-proc new*(T: typedesc[NoSamplingDelayStrategy], rng: ref HmacDrbgContext): T =
+proc new*(T: typedesc[NoSamplingDelayStrategy], rng: Rng): T =
   doAssert(rng != nil, "random is not set")
   T(rng: rng)
 
 method generateForEntry*(self: NoSamplingDelayStrategy): Delay {.gcsafe, raises: [].} =
-  self.rng[].generate(uint16) mod 3
+  self.rng.generate(uint16) mod 3
 
 method generateForIntermediate*(
     self: NoSamplingDelayStrategy, encodedDelay: Delay
@@ -68,7 +68,7 @@ type SpamProtectionDelayStrategy* = ref object of ExponentialDelayStrategy
 proc new*(
     T: typedesc[ExponentialDelayStrategy],
     meanDelay: Delay = DefaultMeanDelay,
-    rng: ref HmacDrbgContext,
+    rng: Rng,
     negligibleProb: float64 = DefaultNegligibleProb,
     minimumDelay: Delay = DefaultMinimumDelay,
 ): T {.raises: [].} =
@@ -86,7 +86,7 @@ proc new*(
 proc new*(
     T: typedesc[SpamProtectionDelayStrategy],
     meanDelay: Delay = DefaultMeanDelay,
-    rng: ref HmacDrbgContext,
+    rng: Rng,
     negligibleProb: float64 = DefaultNegligibleProb,
     minimumDelay: Delay = DefaultSpamProtectionDelayFloor,
 ): T {.raises: [].} =
@@ -103,7 +103,7 @@ proc new*(
 
 proc sampleOpenUnitInterval(self: DelayStrategy): float64 {.inline, raises: [].} =
   const Float64MantissaBits = 53
-  let rand53 = self.rng[].generate(uint64) shr (64 - Float64MantissaBits)
+  let rand53 = self.rng.generate(uint64) shr (64 - Float64MantissaBits)
   (float64(rand53) + 0.5) / float64(1'u64 shl Float64MantissaBits)
 
 proc practicalMaxDelay(meanDelay: Delay, negligibleProb: float64): float64 {.inline.} =

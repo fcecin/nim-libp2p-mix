@@ -2,8 +2,7 @@
 # Copyright (c) Status Research & Development GmbH
 
 import results
-import bearssl/rand
-import libp2p/crypto/curve25519
+import libp2p/crypto/[crypto, curve25519]
 
 const FieldElementSize* = Curve25519KeySize
 
@@ -21,10 +20,10 @@ proc fieldElementToBytes*(fe: FieldElement): seq[byte] =
 
 # Generate a random FieldElement
 proc generateRandomFieldElement*(): Result[FieldElement, string] =
-  let rng = HmacDrbgContext.new()
+  let rng = newRng()
   if rng.isNil:
-    return err("Failed to create HmacDrbgContext with system randomness")
-  ok(Curve25519Key.random(rng[]))
+    return err("Failed to create Rng with system randomness")
+  ok(Curve25519Key.random(rng))
 
 # Generate a key pair (private key and public key are both FieldElements)
 proc generateKeyPair*(): Result[tuple[privateKey, publicKey: FieldElement], string] =

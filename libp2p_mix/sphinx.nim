@@ -160,7 +160,7 @@ proc createSURB*(
     delay: openArray[Delay],
     hops: openArray[Hop],
     id: SURBIdentifier,
-    rng: ref HmacDrbgContext,
+    rng: Rng,
 ): Result[SURB, string] =
   if rng.isNil:
     return err("rng must not be nil")
@@ -178,7 +178,7 @@ proc createSURB*(
 
   # Generate key
   var key = newSeqUninit[byte](k)
-  rng[].generate(key)
+  rng.generate(key)
 
   return ok(
     SURB(
