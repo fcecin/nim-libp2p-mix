@@ -3,7 +3,7 @@
 
 {.used.}
 
-import random, results, chronicles
+import random, results
 import libp2p/crypto/crypto
 import libp2p_mix/[curve25519, serialization, sphinx, tag_manager, delay]
 import ./tools/[unittest, crypto]
