@@ -3,7 +3,7 @@
 
 {.used.}
 
-import random, results, chronicles, bearssl/rand
+import random, results
 import libp2p/crypto/crypto
 import libp2p_mix/[curve25519, serialization, sphinx, tag_manager, delay]
 import ./tools/[unittest, crypto]
@@ -42,7 +42,7 @@ proc createDummyData(): (
   return (message, privateKeys, publicKeys, delay, hops, dest)
 
 template randomI(): SURBIdentifier =
-  rng[].generate(SURBIdentifier)
+  rng().generate(SURBIdentifier)
 
 # Unit tests for sphinx.nim
 suite "Sphinx Tests":

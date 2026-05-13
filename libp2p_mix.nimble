@@ -8,17 +8,12 @@ description =
 license = "MIT"
 skipDirs = @["examples", "tests"]
 
-# nim-libp2p pinned to the master commit that merged the mix-extraction PR
-# (vacp2p/nim-libp2p#2378). That commit removes `MixPubKeyBook` from
-# libp2p/peerstore — required so the local definition in libp2p_mix/pool
-# is unambiguous. The newer libp2p adds a git-pinned boringssl dep that
-# trips nimble's default SAT solver, so the CI workflow uses
-# `--solver:legacy` for `nimble setup`. Once a release including #2378
-# is tagged, replace the pin with `libp2p >= <new-version>`.
+# Pin nim-libp2p master until a release is tagged.
+# CI uses `--solver:legacy` for `nimble setup` (libp2p's boringssl is git-pinned).
 requires "nim >= 2.0.0",
-  "https://github.com/vacp2p/nim-libp2p.git#7e72c0d6df8dd9dbd2902915da332a109aaf7906",
+  "https://github.com/vacp2p/nim-libp2p.git#d4cd68b91b82f34a0ede3766ab1ca8119d5015f8",
   "chronicles >= 0.11.0", "chronos >= 4.2.2", "metrics", "nimcrypto >= 0.6.0",
-  "bearssl >= 0.2.7", "stew >= 0.4.2", "results", "unittest2"
+  "stew >= 0.4.2", "results", "unittest2"
 
 import os, strutils
 

@@ -23,12 +23,19 @@ const NumMixNodes = 10
 
 proc createSwitch(
     multiAddr: MultiAddress,
-    rng: ref HmacDrbgContext,
+    rng: Rng,
     libp2pPrivKey: Opt[SkPrivateKey] = Opt.none(SkPrivateKey),
 ): Switch =
-  let skkey = libp2pPrivKey.valueOr(SkKeyPair.random(rng[]).seckey)
+  let skkey = libp2pPrivKey.valueOr(SkKeyPair.random(rng).seckey)
   let privKey = PrivateKey(scheme: Secp256k1, skkey: skkey)
-  newStandardSwitchBuilder(privKey = Opt.some(privKey), addrs = multiAddr, rng = rng)
+  SwitchBuilder
+    .new()
+    .withRng(rng)
+    .withPrivateKey(privKey)
+    .withAddress(multiAddr)
+    .withTcpTransport()
+    .withMplex()
+    .withNoise()
     .build()
 
 proc mixPingSimulation() {.async: (raises: [Exception]).} =

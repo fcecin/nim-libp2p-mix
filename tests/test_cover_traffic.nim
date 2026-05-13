@@ -11,7 +11,7 @@ import libp2p/crypto/[crypto, secp]
 import ./tools/[unittest, crypto]
 
 proc makePeerInfo(): (PeerId, MultiAddress) =
-  let kp = SkKeyPair.random(rng()[])
+  let kp = SkKeyPair.random(rng())
   let pubKeyProto = PublicKey(scheme: Secp256k1, skkey: kp.pubkey)
   let pid = PeerId.init(pubKeyProto).expect("PeerId init")
   let ma = MultiAddress.init("/ip4/127.0.0.1/tcp/5000").tryGet()
