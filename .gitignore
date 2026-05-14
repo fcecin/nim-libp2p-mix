@@ -13,3 +13,7 @@ build/
 *.a
 *.o
 examples/mix_ping
+
+# Nix build outputs
+result
+result-*
