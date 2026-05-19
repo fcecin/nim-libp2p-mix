@@ -58,7 +58,6 @@ type MixProtocol* = ref object of LPProtocol
   rng: Rng
   # TODO: verify if this requires cleanup for cases in which response never arrives (and connection is closed)
   connCreds: Table[SURBIdentifier, ConnCreds]
-  destReadBehavior: TableRef[string, DestReadBehavior]
   connPool: Table[PeerId, Connection]
   spamProtection: Opt[SpamProtection]
   delayStrategy: DelayStrategy
@@ -66,14 +65,6 @@ type MixProtocol* = ref object of LPProtocol
   ongoingMixMessages: seq[Future[void]]
     ## Tracks all in-flight handleMixMessages futures so they can be
     ## cancelled on stop and waited for during teardown.
-
-proc hasDestReadBehavior*(mixProto: MixProtocol, codec: string): bool =
-  return mixProto.destReadBehavior.hasKey(codec)
-
-proc registerDestReadBehavior*(
-    mixProto: MixProtocol, codec: string, behavior: DestReadBehavior
-) =
-  mixProto.destReadBehavior[codec] = behavior
 
 proc cryptoRandomInt(rng: Rng, max: int): Result[int, string] =
   if max == 0:
@@ -306,7 +297,11 @@ method handleMixMessages*(
         Opt.none(PeerId)
 
     await mixProto.exitLayer.onMessage(
-      deserialized.codec, message, processedSP.destination, surbs
+      deserialized.codec,
+      deserialized.readSpec,
+      message,
+      processedSP.destination,
+      surbs,
     )
 
     mix_messages_forwarded.inc(labelValues = ["Exit"])
@@ -653,10 +648,10 @@ proc sendPacket(
   return ok()
 
 proc buildMessage(
-    msg: seq[byte], codec: string, peerId: PeerId
+    msg: seq[byte], codec: string, peerId: PeerId, readSpec: MixReadSpec = DefaultMixReadSpec
 ): Result[Message, (string, string)] =
   let
-    mixMsg = MixMessage.init(msg, codec)
+    mixMsg = MixMessage.init(msg, codec, readSpec)
     serialized = mixMsg.serialize()
 
   if serialized.len > DataSize:
@@ -707,6 +702,7 @@ proc anonymizeLocalProtocolSend*(
     codec: string,
     destination: MixDestination,
     numSurbs: uint8,
+    readSpec: MixReadSpec,
 ): Future[Result[void, string]] {.async: (raises: [CancelledError, LPStreamError]).} =
   when not defined(libp2p_mix_experimental_exit_is_dest):
     doAssert destination.kind == ForwardAddr, "Only exit != destination is allowed"
@@ -848,7 +844,9 @@ proc anonymizeLocalProtocolSend*(
   ).valueOr:
     return err(fmt"Could not prepend SURBs: {error}")
 
-  let message = buildMessage(msgWithSurbs, codec, mixProto.mixNodeInfo.peerId).valueOr:
+  let message = buildMessage(
+    msgWithSurbs, codec, mixProto.mixNodeInfo.peerId, readSpec
+  ).valueOr:
     mix_messages_error.inc(labelValues = ["Entry", error[1]])
     return err(fmt"Error building message: {error[0]}")
 
@@ -1033,8 +1031,6 @@ proc init*(
   mixProto.rng = switch.rng
   mixProto.nodePool = MixNodePool.new(switch.peerStore)
   mixProto.tagManager = tagManager
-  mixProto.destReadBehavior = newTable[string, DestReadBehavior]()
-
   mixProto.spamProtection = spamProtection
   mixProto.delayStrategy = delayStrategy.valueOr:
     NoSamplingDelayStrategy.new(switch.rng)
@@ -1073,7 +1069,7 @@ proc init*(
   ) {.async: (raises: [CancelledError]).} =
     await mixProto.reply(surb, message)
 
-  mixProto.exitLayer = ExitLayer.init(switch, onReplyDialer, mixProto.destReadBehavior)
+  mixProto.exitLayer = ExitLayer.init(switch, onReplyDialer)
 
   mixProto.codecs = @[MixProtocolID]
   mixProto.handler = proc(
