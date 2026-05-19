@@ -6,6 +6,7 @@ author = "Status Research & Development GmbH"
 description =
   "Mix protocol for nim-libp2p — anonymous routing with the Sphinx packet format"
 license = "MIT"
+entryPoints = @["libp2p_mix.nim", "examples/mix_ping.nim"]
 skipDirs = @["examples", "tests"]
 
 # Pin nim-libp2p master until a release is tagged.
@@ -39,6 +40,7 @@ proc buildExample(filename: string) =
   let cmd = nimc & " " & lang & " " & cfg & " " & flags & " --hints:off"
   exec cmd & " examples/" & filename
   let exeName = filename.changeFileExt("").toExe
+  exec "./examples/" & exeName
   rmFile "examples/" & exeName
 
 task test, "Run unit tests":
