@@ -6,21 +6,70 @@ import stew/[byteutils, leb128]
 import libp2p/protobuf/minprotobuf
 import libp2p/utils/sequninit
 
+type ReadMethod* = enum
+  ReadExactly
+  ReadLp
+  ReadLine
+
 type MixMessage* = object
   message*: seq[byte]
   codec*: string
+  readMethod*: ReadMethod
+  readLimit*: int
+  readLineSep*: string
 
-proc init*(T: typedesc[MixMessage], message: openArray[byte], codec: string): T =
-  return T(message: @message, codec: codec)
+proc init*(
+    T: typedesc[MixMessage],
+    message: openArray[byte],
+    codec: string,
+    readMethod: ReadMethod = ReadExactly,
+    readLimit: int = 0,
+    readLineSep: string = "",
+): T =
+  return T(
+    message: @message,
+    codec: codec,
+    readMethod: readMethod,
+    readLimit: readLimit,
+    readLineSep: readLineSep,
+  )
 
 proc serialize*(mixMsg: MixMessage): seq[byte] =
-  let vbytes = toBytes(mixMsg.codec.len.uint64, Leb128)
-  doAssert vbytes.len <= 2, "serialization failed: codec length exceeds 2 bytes"
+  let codecLenBytes = toBytes(mixMsg.codec.len.uint64, Leb128)
+  doAssert codecLenBytes.len <= 2, "serialization failed: codec length exceeds 2 bytes"
 
-  var buf = newSeqUninit[byte](vbytes.len + mixMsg.codec.len + mixMsg.message.len)
-  buf[0 ..< vbytes.len] = vbytes.toOpenArray()
-  buf[vbytes.len ..< mixMsg.codec.len] = mixMsg.codec.toBytes()
-  buf[vbytes.len + mixMsg.codec.len ..< buf.len] = mixMsg.message
+  let readLimitBytes = toBytes(mixMsg.readLimit.uint64, Leb128)
+  doAssert readLimitBytes.len <= 2, "serialization failed: readLimit exceeds 2 bytes"
+
+  var totalLen = codecLenBytes.len + mixMsg.codec.len + 1 + readLimitBytes.len + mixMsg.message.len
+  if mixMsg.readMethod == ReadLine:
+    let sepLenBytes = toBytes(mixMsg.readLineSep.len.uint64, Leb128)
+    doAssert sepLenBytes.len <= 2, "serialization failed: separator length exceeds 2 bytes"
+    totalLen += sepLenBytes.len + mixMsg.readLineSep.len
+
+  var buf = newSeqUninit[byte](totalLen)
+  var offset = 0
+
+  buf[offset ..< offset + codecLenBytes.len] = codecLenBytes.toOpenArray()
+  offset += codecLenBytes.len
+
+  buf[offset ..< offset + mixMsg.codec.len] = mixMsg.codec.toBytes()
+  offset += mixMsg.codec.len
+
+  buf[offset] = mixMsg.readMethod.byte
+  offset += 1
+
+  buf[offset ..< offset + readLimitBytes.len] = readLimitBytes.toOpenArray()
+  offset += readLimitBytes.len
+
+  if mixMsg.readMethod == ReadLine:
+    let sepLenBytes = toBytes(mixMsg.readLineSep.len.uint64, Leb128)
+    buf[offset ..< offset + sepLenBytes.len] = sepLenBytes.toOpenArray()
+    offset += sepLenBytes.len
+    buf[offset ..< offset + mixMsg.readLineSep.len] = mixMsg.readLineSep.toBytes()
+    offset += mixMsg.readLineSep.len
+
+  buf[offset ..< buf.len] = mixMsg.message
   buf
 
 proc deserialize*(
@@ -29,22 +78,56 @@ proc deserialize*(
   if data.len == 0:
     return err("deserialization failed: data is empty")
 
-  var codecLen: int
-  var varintLen: int
-  for i in 0 ..< min(data.len, 2):
-    let parsed = uint16.fromBytes(data[0 ..< i], Leb128)
-    if parsed.len < 0 or (i == 1 and parsed.len == 0):
-      return err("deserialization failed: invalid codec length")
+  # Parse codec length
+  let codecLenParsed = uint16.fromBytes(data, Leb128)
+  if codecLenParsed.len <= 0:
+    return err("deserialization failed: invalid codec length")
+  let codecLen = codecLenParsed.val.int
+  var offset = codecLenParsed.len.int
 
-    varintLen = parsed.len
-    codecLen = parsed.val.int
+  if data.len < offset + codecLen:
+    return err("deserialization failed: not enough data for codec")
 
-  if data.len < varintLen + codecLen:
-    return err("deserialization failed: not enough data")
+  let codec = string.fromBytes(data[offset ..< offset + codecLen])
+  offset += codecLen
 
-  ok(
-    T(
-      codec: string.fromBytes(data[varintLen ..< varintLen + codecLen]),
-      message: data[varintLen + codecLen ..< data.len],
-    )
-  )
+  if data.len < offset + 1:
+    return err("deserialization failed: not enough data for readMethod")
+  if data[offset] > byte(high(ReadMethod)):
+    return err("deserialization failed: invalid readMethod")
+  let readMethod = ReadMethod(data[offset])
+  offset += 1
+
+  if data.len < offset + 1:
+    return err("deserialization failed: not enough data for readLimit")
+  let readLimitParsed = uint16.fromBytes(data[offset .. ^1], Leb128)
+  if readLimitParsed.len <= 0:
+    return err("deserialization failed: invalid readLimit")
+  let readLimit = readLimitParsed.val.int
+  offset += readLimitParsed.len.int
+
+  var readLineSep = ""
+  if readMethod == ReadLine:
+    if data.len < offset + 1:
+      return err("deserialization failed: not enough data for separator length")
+    let sepLenParsed = uint16.fromBytes(data[offset .. ^1], Leb128)
+    if sepLenParsed.len <= 0:
+      return err("deserialization failed: invalid separator length")
+    let sepLen = sepLenParsed.val.int
+    offset += sepLenParsed.len.int
+    if data.len < offset + sepLen:
+      return err("deserialization failed: not enough data for separator")
+    readLineSep = string.fromBytes(data[offset ..< offset + sepLen])
+    offset += sepLen
+
+  if data.len < offset:
+    return err("deserialization failed: not enough data for message")
+  let message = data[offset ..< data.len]
+
+  ok(T(
+    message: message,
+    codec: codec,
+    readMethod: readMethod,
+    readLimit: readLimit,
+    readLineSep: readLineSep,
+  ))

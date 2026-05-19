@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 # Copyright (c) Status Research & Development GmbH
 
-import chronicles, chronos, metrics, std/sequtils, std/tables
+import chronicles, chronos, metrics, std/sequtils
 import libp2p/builders
+import libp2p/protobuf/minprotobuf
 import libp2p/stream/connection
 import libp2p/varint
 import libp2p/utils/sequninit
-import ./[mix_metrics, reply_connection, serialization, multiaddr]
+import stew/byteutils
+import ./[mix_message, mix_metrics, reply_connection, serialization, multiaddr]
 
 when defined(libp2p_mix_experimental_exit_is_dest):
   import std/enumerate
@@ -15,33 +17,16 @@ when defined(libp2p_mix_experimental_exit_is_dest):
 type OnReplyDialer* =
   proc(surb: SURB, message: seq[byte]) {.async: (raises: [CancelledError]).}
 
-## Callback type for reading responses from a destination connection
-type destReadBehaviorCb* = proc(conn: Connection): Future[seq[byte]] {.
-  async: (raises: [CancelledError, LPStreamError])
-.}
-
-## Wrapper for destination read behavior with metadata.
-## When a callback uses length-prefixed reads (e.g., readLp), it strips the length prefix.
-## Setting usesLengthPrefix=true tells the exit layer to restore the prefix in the reply,
-## ensuring that application code can correctly call readLp() on the MixEntryConnection.
-type DestReadBehavior* = object
-  callback*: destReadBehaviorCb
-  usesLengthPrefix*: bool
-
 type ExitLayer* = object
   switch: Switch
   onReplyDialer: OnReplyDialer
-  destReadBehavior: TableRef[string, DestReadBehavior]
 
 proc init*(
     T: typedesc[ExitLayer],
     switch: Switch,
     onReplyDialer: OnReplyDialer,
-    destReadBehavior: TableRef[string, DestReadBehavior],
 ): T =
-  ExitLayer(
-    switch: switch, onReplyDialer: onReplyDialer, destReadBehavior: destReadBehavior
-  )
+  ExitLayer(switch: switch, onReplyDialer: onReplyDialer)
 
 proc replyDialerCbFactory(self: ExitLayer): MixReplyDialer =
   return proc(
@@ -67,23 +52,23 @@ proc reply(
 
 when defined(libp2p_mix_experimental_exit_is_dest):
   proc runHandler(
-      self: ExitLayer, codec: string, message: seq[byte], surbs: seq[SURB]
+      self: ExitLayer, mixMsg: MixMessage, surbs: seq[SURB]
   ) {.async: (raises: [CancelledError]).} =
-    let exitConn = MixExitConnection.new(message)
+    let exitConn = MixExitConnection.new(mixMsg.message)
     defer:
       await exitConn.close()
 
     var hasHandler: bool = false
     for index, handler in enumerate(self.switch.ms.handlers):
-      if codec in handler.protos:
+      if mixMsg.codec in handler.protos:
         try:
           hasHandler = true
-          await handler.protocol.handler(exitConn, codec)
+          await handler.protocol.handler(exitConn, mixMsg.codec)
         except CatchableError as e:
           error "Error during execution of MixProtocol handler: ", err = e.msg
 
     if not hasHandler:
-      error "Handler doesn't exist", codec = codec
+      error "Handler doesn't exist", codec = mixMsg.codec
       return
 
     if surbs.len != 0:
@@ -92,8 +77,7 @@ when defined(libp2p_mix_experimental_exit_is_dest):
 
 proc fwdRequest(
     self: ExitLayer,
-    codec: string,
-    message: seq[byte],
+    mixMsg: MixMessage,
     destination: Hop,
     surbs: seq[SURB],
 ) {.async: (raises: [CancelledError]).} =
@@ -114,34 +98,26 @@ proc fwdRequest(
 
   var response: seq[byte]
   try:
-    let destConn = await self.switch.dial(destPeerId, @[destAddr], codec)
+    let destConn = await self.switch.dial(destPeerId, @[destAddr], mixMsg.codec)
     defer:
       await destConn.close()
-    await destConn.write(message)
+    await destConn.write(mixMsg.message)
 
     if surbs.len != 0:
-      if not self.destReadBehavior.hasKey(codec):
-        error "No destReadBehavior for codec", codec
-        return
-
-      var behavior: DestReadBehavior
-      try:
-        behavior = self.destReadBehavior[codec]
-      except KeyError:
-        raiseAssert "checked with HasKey"
-
-      let rawResponse = await behavior.callback(destConn)
-
-      # Add length prefix back only if the behavior callback uses length-prefixed reads
-      # (e.g., readLp). This ensures that when application code calls readLp() on the
-      # MixEntryConnection, it can correctly read the response.
-      if behavior.usesLengthPrefix:
+      case mixMsg.readMethod
+      of ReadExactly:
+        let buf = newSeqUninit[byte](mixMsg.readLimit)
+        await destConn.readExactly(addr buf[0], mixMsg.readLimit)
+        response = buf
+      of ReadLp:
+        let rawResponse = await destConn.readLp(mixMsg.readLimit)
         let vbytes = PB.toBytes(rawResponse.len.uint64)
         response = newSeqUninit[byte](rawResponse.len + vbytes.len)
         response[0 ..< vbytes.len] = vbytes.toOpenArray()
         response[vbytes.len ..< response.len] = rawResponse
-      else:
-        response = rawResponse
+      of ReadLine:
+        let rawResponse = await destConn.readLine(mixMsg.readLimit, mixMsg.readLineSep)
+        response = (rawResponse & mixMsg.readLineSep).toBytes()
   except LPStreamError as exc:
     error "Stream error while writing to next hop: ", err = exc.msg
     mix_messages_error.inc(labelValues = ["ExitLayer", "LPSTREAM_ERR"])
@@ -155,17 +131,16 @@ proc fwdRequest(
 
 proc onMessage*(
     self: ExitLayer,
-    codec: string,
-    message: seq[byte],
+    mixMsg: MixMessage,
     destination: Hop,
     surbs: seq[SURB],
 ) {.async: (raises: [CancelledError]).} =
   when defined(libp2p_mix_experimental_exit_is_dest):
     if destination == Hop():
-      trace "onMessage - exit is destination", codec, message
-      await self.runHandler(codec, message, surbs)
+      trace "onMessage - exit is destination", codec = mixMsg.codec, message = mixMsg.message
+      await self.runHandler(mixMsg, surbs)
     else:
-      trace "onMessage - exist is not destination", codec, message
-      await self.fwdRequest(codec, message, destination, surbs)
+      trace "onMessage - exit is not destination", codec = mixMsg.codec, message = mixMsg.message
+      await self.fwdRequest(mixMsg, destination, surbs)
   else:
-    await self.fwdRequest(codec, message, destination, surbs)
+    await self.fwdRequest(mixMsg, destination, surbs)

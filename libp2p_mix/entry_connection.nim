@@ -5,7 +5,7 @@ import hashes, chronos, results, chronicles
 import libp2p/stream/connection
 import libp2p/varint
 import libp2p/utils/sequninit
-import ./mix_protocol
+import ./[mix_message, mix_protocol]
 from fragmentation import DataSize
 
 const DefaultSurbs = uint8(4)
@@ -17,6 +17,9 @@ type MixDialer* = proc(
 type MixParameters* = object
   expectReply*: Opt[bool]
   numSurbs*: Opt[uint8]
+  readMethod*: Opt[ReadMethod]
+  readLimit*: Opt[int]
+  readLineSep*: Opt[string]
 
 type MixEntryConnection* = ref object of Connection
   destination: MixDestination
@@ -98,6 +101,10 @@ proc new*(
     else:
       0
 
+  let readMethod = params.readMethod.get(ReadExactly)
+  let readLimit = params.readLimit.get(0)
+  let readLineSep = params.readLineSep.get("")
+
   var instance = T()
   instance.destination = destination
   instance.codec = codec
@@ -114,7 +121,7 @@ proc new*(
       msg: seq[byte], codec: string, dest: MixDestination
   ): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
     let sendRes = await srcMix.anonymizeLocalProtocolSend(
-      instance.incoming, msg, codec, dest, numSurbs
+      instance.incoming, msg, codec, dest, numSurbs, readMethod, readLimit, readLineSep
     )
     if sendRes.isErr:
       raise newException(LPStreamError, sendRes.error)
@@ -130,10 +137,4 @@ proc toConnection*(
   ## Create a stream to send and optionally receive responses.
   ## Under the hood it will wrap the message in a sphinx packet
   ## and send it via a random mix path.
-  if not srcMix.hasDestReadBehavior(codec):
-    if params.expectReply.get(false):
-      return err("no destination read behavior for codec")
-    else:
-      warn "no destination read behavior for codec", codec
-
   ok(MixEntryConnection.new(srcMix, destination, codec, params))

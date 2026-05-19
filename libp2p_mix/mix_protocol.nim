@@ -58,7 +58,6 @@ type MixProtocol* = ref object of LPProtocol
   rng: Rng
   # TODO: verify if this requires cleanup for cases in which response never arrives (and connection is closed)
   connCreds: Table[SURBIdentifier, ConnCreds]
-  destReadBehavior: TableRef[string, DestReadBehavior]
   connPool: Table[PeerId, Connection]
   spamProtection: Opt[SpamProtection]
   delayStrategy: DelayStrategy
@@ -67,13 +66,7 @@ type MixProtocol* = ref object of LPProtocol
     ## Tracks all in-flight handleMixMessages futures so they can be
     ## cancelled on stop and waited for during teardown.
 
-proc hasDestReadBehavior*(mixProto: MixProtocol, codec: string): bool =
-  return mixProto.destReadBehavior.hasKey(codec)
 
-proc registerDestReadBehavior*(
-    mixProto: MixProtocol, codec: string, behavior: DestReadBehavior
-) =
-  mixProto.destReadBehavior[codec] = behavior
 
 proc cryptoRandomInt(rng: Rng, max: int): Result[int, string] =
   if max == 0:
@@ -305,8 +298,15 @@ method handleMixMessages*(
         Opt.some(fromPeerId),
         Opt.none(PeerId)
 
+    let appMixMsg = MixMessage.init(
+      message,
+      deserialized.codec,
+      deserialized.readMethod,
+      deserialized.readLimit,
+      deserialized.readLineSep,
+    )
     await mixProto.exitLayer.onMessage(
-      deserialized.codec, message, processedSP.destination, surbs
+      appMixMsg, processedSP.destination, surbs
     )
 
     mix_messages_forwarded.inc(labelValues = ["Exit"])
@@ -498,12 +498,16 @@ proc handleMixNodeConnection(
     mixProto.spawnMixMessage(conn.peerId, receivedBytes, metadataBytes)
 
 proc getMaxMessageSizeForCodec*(
-    codec: string, numberOfSurbs: uint8 = 0
+    codec: string,
+    numberOfSurbs: uint8 = 0,
+    readMethod: ReadMethod = ReadExactly,
+    readLimit: int = 0,
+    readLineSep: string = "",
 ): Result[int, string] =
-  ## Computes the maximum payload size (in bytes) available for a message when encoded  
-  ## with the given `codec`, optionally including space for the chosen number of surbs.  
-  ## Returns an error if the codec + surb overhead exceeds the data capacity.  
-  let serializedMsg = MixMessage.init(@[], codec).serialize()
+  ## Computes the maximum payload size (in bytes) available for a message when encoded
+  ## with the given `codec`, optionally including space for the chosen number of surbs.
+  ## Returns an error if the codec + surb overhead exceeds the data capacity.
+  let serializedMsg = MixMessage.init(@[], codec, readMethod, readLimit, readLineSep).serialize()
   let totalLen = serializedMsg.len + SurbLenSize + (int(numberOfSurbs) * SurbSize)
   if totalLen > DataSize:
     return err("cannot encode messages for this codec")
@@ -653,10 +657,15 @@ proc sendPacket(
   return ok()
 
 proc buildMessage(
-    msg: seq[byte], codec: string, peerId: PeerId
+    msg: seq[byte],
+    codec: string,
+    peerId: PeerId,
+    readMethod: ReadMethod = ReadExactly,
+    readLimit: int = 0,
+    readLineSep: string = "",
 ): Result[Message, (string, string)] =
   let
-    mixMsg = MixMessage.init(msg, codec)
+    mixMsg = MixMessage.init(msg, codec, readMethod, readLimit, readLineSep)
     serialized = mixMsg.serialize()
 
   if serialized.len > DataSize:
@@ -707,6 +716,9 @@ proc anonymizeLocalProtocolSend*(
     codec: string,
     destination: MixDestination,
     numSurbs: uint8,
+    readMethod: ReadMethod = ReadExactly,
+    readLimit: int = 0,
+    readLineSep: string = "",
 ): Future[Result[void, string]] {.async: (raises: [CancelledError, LPStreamError]).} =
   when not defined(libp2p_mix_experimental_exit_is_dest):
     doAssert destination.kind == ForwardAddr, "Only exit != destination is allowed"
@@ -848,7 +860,9 @@ proc anonymizeLocalProtocolSend*(
   ).valueOr:
     return err(fmt"Could not prepend SURBs: {error}")
 
-  let message = buildMessage(msgWithSurbs, codec, mixProto.mixNodeInfo.peerId).valueOr:
+  let message = buildMessage(
+    msgWithSurbs, codec, mixProto.mixNodeInfo.peerId, readMethod, readLimit, readLineSep
+  ).valueOr:
     mix_messages_error.inc(labelValues = ["Entry", error[1]])
     return err(fmt"Error building message: {error[0]}")
 
@@ -868,7 +882,7 @@ proc reply(
       return
 
   # Message does not require a codec, as it is already associated to a specific I
-  let message = buildMessage(msg, "", peerId).valueOr:
+  let message = buildMessage(msg, "", peerId, ReadExactly, 0, "").valueOr:
     error "could not build reply message", err = error
     return
 
@@ -951,7 +965,7 @@ proc buildCoverPacket*(
   mixProto.rng.generate(randomPayload)
 
   let message = buildMessage(
-    randomPayload, CoverTrafficCodec, mixProto.mixNodeInfo.peerId
+    randomPayload, CoverTrafficCodec, mixProto.mixNodeInfo.peerId, ReadExactly, 0, ""
   ).valueOr:
     return err("Error building cover message: " & error[0])
 
@@ -1033,8 +1047,6 @@ proc init*(
   mixProto.rng = switch.rng
   mixProto.nodePool = MixNodePool.new(switch.peerStore)
   mixProto.tagManager = tagManager
-  mixProto.destReadBehavior = newTable[string, DestReadBehavior]()
-
   mixProto.spamProtection = spamProtection
   mixProto.delayStrategy = delayStrategy.valueOr:
     NoSamplingDelayStrategy.new(switch.rng)
@@ -1073,7 +1085,7 @@ proc init*(
   ) {.async: (raises: [CancelledError]).} =
     await mixProto.reply(surb, message)
 
-  mixProto.exitLayer = ExitLayer.init(switch, onReplyDialer, mixProto.destReadBehavior)
+  mixProto.exitLayer = ExitLayer.init(switch, onReplyDialer)
 
   mixProto.codecs = @[MixProtocolID]
   mixProto.handler = proc(
