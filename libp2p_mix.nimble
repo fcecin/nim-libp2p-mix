@@ -9,11 +9,9 @@ license = "MIT"
 skipDirs = @["examples", "tests"]
 
 # Pin nim-libp2p master until a release is tagged.
-# Bumped to current master HEAD so downstreams (waku) can pick up the
-# service-discovery propagation fixes (PRs #2434, #2502, plus the empty
-# service-rtable fallback) that landed after the previous `#d4cd68b` pin.
+# CI uses `--solver:legacy` for `nimble setup` (libp2p's boringssl is git-pinned).
 requires "nim >= 2.0.0",
-  "https://github.com/vacp2p/nim-libp2p.git#f3278ea04ac8aa024f852678fd4a634275764825",
+  "https://github.com/vacp2p/nim-libp2p.git#d4cd68b91b82f34a0ede3766ab1ca8119d5015f8",
   "chronicles >= 0.11.0", "chronos >= 4.2.2", "metrics", "nimcrypto >= 0.6.0",
   "stew >= 0.4.2", "results", "unittest2"
 
