@@ -294,11 +294,7 @@ method handleMixMessages*(
         Opt.none(PeerId)
 
     await mixProto.exitLayer.onMessage(
-      deserialized.codec,
-      deserialized.readSpec,
-      message,
-      processedSP.destination,
-      surbs,
+      deserialized.codec, deserialized.readSpec, message, processedSP.destination, surbs
     )
 
     mix_messages_forwarded.inc(labelValues = ["Exit"])
@@ -645,7 +641,10 @@ proc sendPacket(
   return ok()
 
 proc buildMessage(
-    msg: seq[byte], codec: string, peerId: PeerId, readSpec: MixReadSpec = DefaultMixReadSpec
+    msg: seq[byte],
+    codec: string,
+    peerId: PeerId,
+    readSpec: MixReadSpec = DefaultMixReadSpec,
 ): Result[Message, (string, string)] =
   let
     mixMsg = MixMessage.init(msg, codec, readSpec)
@@ -840,9 +839,7 @@ proc anonymizeLocalProtocolSend*(
   ).valueOr:
     return err(fmt"Could not prepend SURBs: {error}")
 
-  let message = buildMessage(
-    msgWithSurbs, codec, mixProto.mixNodeInfo.peerId, readSpec
-  ).valueOr:
+  let message = buildMessage(msgWithSurbs, codec, mixProto.mixNodeInfo.peerId, readSpec).valueOr:
     mix_messages_error.inc(labelValues = ["Entry", error[1]])
     return err(fmt"Error building message: {error[0]}")
 

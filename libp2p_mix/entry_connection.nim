@@ -134,7 +134,9 @@ proc toConnection*(
   ## Create a stream to send and optionally receive responses.
   ## Under the hood it will wrap the message in a sphinx packet
   ## and send it via a random mix path.
-  if params.expectReply.get(false) and destination.isForwardAddr and params.readSpec.isNone:
-    return err("read spec is required when expecting replies from forwarded destinations")
+  if params.expectReply.get(false) and destination.isForwardAddr and
+      params.readSpec.isNone:
+    return
+      err("read spec is required when expecting replies from forwarded destinations")
 
   ok(MixEntryConnection.new(srcMix, destination, codec, params))

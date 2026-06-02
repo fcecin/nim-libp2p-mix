@@ -50,7 +50,8 @@ suite "Mix Protocol - Connection API":
 
     check:
       conn.isErr
-      conn.error == "read spec is required when expecting replies from forwarded destinations"
+      conn.error ==
+        "read spec is required when expecting replies from forwarded destinations"
 
   asyncTest "read from write-only connection raises error":
     let nodes = await setupMixNodes(10)

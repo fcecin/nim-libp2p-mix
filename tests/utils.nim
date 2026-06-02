@@ -80,7 +80,7 @@ proc setupMixNodes*(
   nodes
 
 proc setupMixNodesWithMock*(
-    numNodes: int,
+    numNodes: int
 ): Future[tuple[nodes: seq[MixProtocol], mock: MockMixProtocol]] {.async.} =
   ## Like setupMixNodes, but the first node is a MockMixProtocol.
   var nodes: seq[MixProtocol] = @[]
@@ -91,9 +91,7 @@ proc setupMixNodesWithMock*(
   let mockSwitch =
     createSwitch(mockMixNodeInfo.multiAddr, Opt.some(mockMixNodeInfo.libp2pPrivKey))
 
-  let mock = setupMixNode[MockMixProtocol](
-    mockMixNodeInfo, mockSwitch, Opt.none(int)
-  )
+  let mock = setupMixNode[MockMixProtocol](mockMixNodeInfo, mockSwitch, Opt.none(int))
   mock.nodePool.add(nodeInfos.includeAllExcept(mockMixNodeInfo))
   nodes.add(mock)
 
@@ -101,8 +99,7 @@ proc setupMixNodesWithMock*(
     let mixNodeInfo = nodeInfos[index]
     let switch =
       createSwitch(mixNodeInfo.multiAddr, Opt.some(mixNodeInfo.libp2pPrivKey))
-    let mixNode =
-      setupMixNode[MixProtocol](mixNodeInfo, switch, Opt.none(int))
+    let mixNode = setupMixNode[MixProtocol](mixNodeInfo, switch, Opt.none(int))
     mixNode.nodePool.add(nodeInfos.includeAllExcept(mixNodeInfo))
     nodes.add(mixNode)
 

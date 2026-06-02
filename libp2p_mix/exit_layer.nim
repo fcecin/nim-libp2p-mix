@@ -7,9 +7,11 @@ import libp2p/stream/connection
 import libp2p/varint
 import libp2p/utils/sequninit
 import stew/byteutils
-import ./[
-  mix_message, mix_metrics, reply_connection, serialization, multiaddr, exit_connection,
-]
+import
+  ./[
+    mix_message, mix_metrics, reply_connection, serialization, multiaddr,
+    exit_connection,
+  ]
 
 type OnReplyDialer* =
   proc(surb: SURB, message: seq[byte]) {.async: (raises: [CancelledError]).}
@@ -18,9 +20,7 @@ type ExitLayer* = object
   switch: Switch
   onReplyDialer: OnReplyDialer
 
-proc init*(
-    T: typedesc[ExitLayer], switch: Switch, onReplyDialer: OnReplyDialer
-): T =
+proc init*(T: typedesc[ExitLayer], switch: Switch, onReplyDialer: OnReplyDialer): T =
   ExitLayer(switch: switch, onReplyDialer: onReplyDialer)
 
 proc replyDialerCbFactory(self: ExitLayer): MixReplyDialer =

@@ -73,7 +73,8 @@ suite "mix_message_tests":
       codecBytes[i] = byte('a')
 
     let mixMsg = MixMessage.init(
-      "hello".toBytes(), string.fromBytes(codecBytes),
+      "hello".toBytes(),
+      string.fromBytes(codecBytes),
       MixReadSpec(readMethod: ReadExactly, limit: 32),
     )
 
@@ -87,23 +88,26 @@ suite "mix_message_tests":
       res.error == "deserialization failed: incomplete codec length"
 
   test "deserialize invalid read method returns error":
-    let res = MixMessage.deserialize(@[0x05'u8] & "/ping".toBytes() & @[0x03'u8, 0x20, 0x00])
+    let res =
+      MixMessage.deserialize(@[0x05'u8] & "/ping".toBytes() & @[0x03'u8, 0x20, 0x00])
     check:
       res.isErr()
       res.error == "deserialization failed: invalid read method"
 
   test "serialize and deserialize ReadLine separator layout":
     let mixMsg = MixMessage.init(
-      "hello".toBytes(), "/line",
+      "hello".toBytes(),
+      "/line",
       MixReadSpec(readMethod: ReadLine, limit: 1024, sep: "\r\n"),
     )
 
     let serialized = mixMsg.serialize()
     check serialized ==
-      @[0x05'u8] & "/line".toBytes() & @[0x02'u8, 0x80, 0x08, 0x02] &
-      "\r\n".toBytes() & "hello".toBytes()
+      @[0x05'u8] & "/line".toBytes() & @[0x02'u8, 0x80, 0x08, 0x02] & "\r\n".toBytes() &
+      "hello".toBytes()
 
-    let deserializedMsg = MixMessage.deserialize(serialized).expect("deserialization failed")
+    let deserializedMsg =
+      MixMessage.deserialize(serialized).expect("deserialization failed")
     check:
       deserializedMsg.codec == "/line"
       deserializedMsg.message == "hello".toBytes()
