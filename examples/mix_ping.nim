@@ -38,7 +38,7 @@ proc createSwitch(
     .withNoise()
     .build()
 
-proc mixPingSimulation() {.async: (raises: [Exception]).} =
+proc mixPingSimulation() {.async: (raises: [CatchableError]).} =
   let rng = newRng()
   let mixNodeInfos = MixNodeInfo.generateRandomMany(NumMixNodes, rng)
   var switches: seq[Switch] = @[]

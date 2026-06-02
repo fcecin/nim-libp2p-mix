@@ -33,7 +33,7 @@ libp2p_mix/               Protocol implementation (23 modules)
   ├── mix_protocol.nim    Core mix protocol (mounts on a libp2p Switch)
   ├── sphinx.nim          Sphinx packet format with LIONESS payload encryption
   ├── cover_traffic.nim   Constant-rate cover-traffic generator
-  ├── exit_layer.nim      Exit-node behaviour & dest read framing
+  ├── exit_layer.nim      Exit-node behaviour, local handlers & dest read framing
   ├── entry_connection.nim/exit_connection.nim/reply_connection.nim
   ├── fragmentation.nim   Packet fragmentation
   ├── pool.nim            Mix node pool / route selection
@@ -82,11 +82,7 @@ let mixNodeInfo = initMixNodeInfo(
   peerId, multiAddr, mixPubKey, mixPrivKey, libp2pPubKey, libp2pPrivKey
 )
 
-let mix = MixProtocol.new(mixNodeInfo, switch).valueOr:
-  return err("mix init failed: " & error)
-
-# Optional: configure how the exit layer reads payloads for a given proto
-mix.registerDestReadBehavior("/your/proto/1.0.0", readLp(maxSize = -1))
+let mix = MixProtocol.new(mixNodeInfo, switch)
 
 # Optional: bootstrap the node pool
 for bootstrapNode in bootstrapNodes:
@@ -103,7 +99,11 @@ await mix.start()
 let conn = mix.toConnection(
   MixDestination.init(targetPeerId, targetMultiAddr),
   proto = "/your/proto/1.0.0",
-  MixParameters(expectReply: Opt.some(true), numSurbs: Opt.some(1.byte)),
+  MixParameters(
+    expectReply: Opt.some(true),
+    numSurbs: Opt.some(1.byte),
+    readSpec: Opt.some(MixReadSpec(readMethod: ReadLp, limit: maxResponseBytes)),
+  )
 ).valueOr:
   return err(error)
 
@@ -112,6 +112,11 @@ let conn = mix.toConnection(
 await conn.writeLp(requestBytes)
 let response = await conn.readLp(maxBytes)
 ```
+
+`MixDestination` selects the delivery mode per request:
+
+- `MixDestination.forwardToAddr(peerId, multiAddr)` or `MixDestination.init(...)` sends to an external destination through a randomly selected exit node. If `expectReply` is true, provide `readSpec` so the exit knows how to read the external response.
+- `MixDestination.exitNode(peerId)` sends to a Mix node that is also the destination. The final node runs its mounted protocol handler directly, so `readSpec` is not required even when expecting replies.
 
 For a complete worked example, see [`examples/mix_ping.nim`](examples/mix_ping.nim).
 
@@ -187,8 +192,9 @@ nimble example
 ```
 
 This compiles `examples/mix_ping.nim`, which spins up 10 mix nodes locally,
-mounts the libp2p `Ping` protocol on a destination, sends a ping through the
-mix network, and waits for the reply via SURBs. Expected output:
+mounts the libp2p `Ping` protocol on an external destination, sends a ping
+through a randomly selected exit node, and waits for the reply via SURBs.
+Expected output:
 
 ```
 INF Ping response received through mix network rtt=41ms…
@@ -197,7 +203,7 @@ INF Ping response received through mix network rtt=41ms…
 To build the binary without auto-cleanup:
 
 ```bash
-nim c -d:libp2p_mix_experimental_exit_is_dest -d:metrics -o:mix_ping examples/mix_ping.nim
+nim c -d:metrics -o:mix_ping examples/mix_ping.nim
 ./mix_ping
 ```
 
@@ -230,7 +236,6 @@ default SAT solver can't resolve the transitive git pins libp2p brings in.
 
 | Flag | Purpose |
 |---|---|
-| `-d:libp2p_mix_experimental_exit_is_dest` | Allow exit nodes to also be the message destination (waku/lightpush usage). Enabled by default in `libp2p_mix.nimble`. |
 | `-d:metrics` | Enable Prometheus-style metric counters (test-time default). |
 | `-d:enable_mix_benchmarks` | Compile in benchmark/timing helpers from `libp2p_mix/benchmark.nim`. |
 

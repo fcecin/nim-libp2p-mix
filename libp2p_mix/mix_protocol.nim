@@ -21,9 +21,6 @@ when defined(enable_mix_benchmarks):
   import ./benchmark
   from times import getTime, toUnixFloat, `-`, initTime, `$`, inMilliseconds, Time
 
-when defined(libp2p_mix_experimental_exit_is_dest):
-  {.warning: "experimental support for mix exit == destination is enabled!".}
-
 const MixProtocolID* = "/mix/1.0.0"
 
 const CoverTrafficCodec* = "/mix/cover/1.0.0"
@@ -685,9 +682,11 @@ proc `$`*(d: MixDestination): string =
   of MixNode:
     return "MixDestination[MixNode](" & $d.peerId & ")"
 
-when defined(libp2p_mix_experimental_exit_is_dest):
-  proc exitNode*(T: typedesc[MixDestination], p: PeerId): T =
-    T(kind: DestinationType.MixNode, peerId: p)
+func isForwardAddr*(d: MixDestination): bool =
+  d.kind == ForwardAddr
+
+proc exitNode*(T: typedesc[MixDestination], p: PeerId): T =
+  T(kind: DestinationType.MixNode, peerId: p)
 
 proc forwardToAddr*(T: typedesc[MixDestination], p: PeerId, address: MultiAddress): T =
   T(kind: DestinationType.ForwardAddr, peerId: p, address: address)
@@ -704,9 +703,6 @@ proc anonymizeLocalProtocolSend*(
     numSurbs: uint8,
     readSpec: MixReadSpec,
 ): Future[Result[void, string]] {.async: (raises: [CancelledError, LPStreamError]).} =
-  when not defined(libp2p_mix_experimental_exit_is_dest):
-    doAssert destination.kind == ForwardAddr, "Only exit != destination is allowed"
-
   mix_messages_recvd.inc(labelValues = ["Entry"])
 
   # Claim a slot for local origination (Mix Cover Traffic spec §6.3)

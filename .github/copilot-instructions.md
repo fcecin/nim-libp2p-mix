@@ -97,7 +97,6 @@ The repo also sets up import paths and includes `nimble.paths` when present (gen
 
 | Flag | Purpose |
 |------|---------|
-| `-d:libp2p_mix_experimental_exit_is_dest` | Allow exit nodes to also be the message destination. Enabled by default in `libp2p_mix.nimble`. |
 | `-d:metrics` | Enable Prometheus-style metric counters (test-time default). |
 | `-d:enable_mix_benchmarks` | Compile in benchmark/timing helpers from `libp2p_mix/benchmark.nim` (if present). |
 
@@ -314,7 +313,8 @@ See `libp2p_mix.nimble` for authoritative constraints. Notable dependencies:
 ### Integration with libp2p Switch
 - `MixProtocol` is mounted on a libp2p `Switch`.
 - Ensure integration code remains compatible with the `libp2p >= 1.15.3` constraint.
-- Keep “destination read behavior” registration (`registerDestReadBehavior`) safe and well-documented.
+- `MixDestination` selects delivery mode per request: `forwardToAddr`/`init` for external destinations, `exitNode` for a Mix node that is also the destination.
+- Forwarded destinations that expect replies must provide `MixReadSpec`; exit-node destinations run local protocol handlers and do not require `MixReadSpec`.
 
 ### Spam protection
 - Spam protection is pluggable via the `SpamProtection` abstract base.

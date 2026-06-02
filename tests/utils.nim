@@ -35,7 +35,6 @@ proc createSwitch*(
 proc setupMixNode[T: MixProtocol](
     mixNodeInfo: MixNodeInfo,
     switch: Switch,
-    destReadBehavior: Opt[tuple[codec: string, callback: DestReadBehavior]],
     spamProtectionRateLimit: Opt[int],
     delayStrategy: Opt[DelayStrategy] = Opt.none(DelayStrategy),
 ): T =
@@ -59,16 +58,11 @@ proc setupMixNode[T: MixProtocol](
     delayStrategy = Opt.some(actualDelayStrategy),
   )
 
-  if destReadBehavior.isSome():
-    let (codec, callback) = destReadBehavior.get()
-    proto.registerDestReadBehavior(codec, callback)
-
   switch.mount(proto)
   proto
 
 proc setupMixNodes*(
     numNodes: int,
-    destReadBehavior = Opt.none(tuple[codec: string, callback: DestReadBehavior]),
     spamProtectionRateLimit = Opt.none(int),
     delayStrategy = Opt.none(DelayStrategy),
 ): Future[seq[MixProtocol]] {.async.} =
@@ -78,7 +72,7 @@ proc setupMixNodes*(
     let switch =
       createSwitch(mixNodeInfo.multiAddr, Opt.some(mixNodeInfo.libp2pPrivKey))
     let mixNode = setupMixNode[MixProtocol](
-      mixNodeInfo, switch, destReadBehavior, spamProtectionRateLimit, delayStrategy
+      mixNodeInfo, switch, spamProtectionRateLimit, delayStrategy
     )
     mixNode.nodePool.add(nodeInfos.includeAllExcept(mixNodeInfo))
     nodes.add(mixNode)
@@ -87,7 +81,6 @@ proc setupMixNodes*(
 
 proc setupMixNodesWithMock*(
     numNodes: int,
-    destReadBehavior = Opt.none(tuple[codec: string, callback: DestReadBehavior]),
 ): Future[tuple[nodes: seq[MixProtocol], mock: MockMixProtocol]] {.async.} =
   ## Like setupMixNodes, but the first node is a MockMixProtocol.
   var nodes: seq[MixProtocol] = @[]
@@ -99,7 +92,7 @@ proc setupMixNodesWithMock*(
     createSwitch(mockMixNodeInfo.multiAddr, Opt.some(mockMixNodeInfo.libp2pPrivKey))
 
   let mock = setupMixNode[MockMixProtocol](
-    mockMixNodeInfo, mockSwitch, destReadBehavior, Opt.none(int)
+    mockMixNodeInfo, mockSwitch, Opt.none(int)
   )
   mock.nodePool.add(nodeInfos.includeAllExcept(mockMixNodeInfo))
   nodes.add(mock)
@@ -109,7 +102,7 @@ proc setupMixNodesWithMock*(
     let switch =
       createSwitch(mixNodeInfo.multiAddr, Opt.some(mixNodeInfo.libp2pPrivKey))
     let mixNode =
-      setupMixNode[MixProtocol](mixNodeInfo, switch, destReadBehavior, Opt.none(int))
+      setupMixNode[MixProtocol](mixNodeInfo, switch, Opt.none(int))
     mixNode.nodePool.add(nodeInfos.includeAllExcept(mixNodeInfo))
     nodes.add(mixNode)
 
