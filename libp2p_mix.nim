@@ -37,5 +37,7 @@ export add
 export remove
 export peerIds
 
-export exitNode
 export forwardToAddr
+
+when defined(libp2p_mix_experimental_exit_is_dest):
+  export exitNode

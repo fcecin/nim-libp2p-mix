@@ -127,27 +127,28 @@ suite "Mix Protocol - Message Delivery":
       sender notin exitNodes
       destination notin exitNodes
 
-  asyncTest "expect reply, exit == destination":
-    let nodes = await setupMixNodes(10)
+  when defined(libp2p_mix_experimental_exit_is_dest):
+    asyncTest "expect reply, exit == destination":
+      let nodes = await setupMixNodes(10)
 
-    let destNode = nodes[^1]
-    let pingProto = Ping.new(rng = rng())
-    destNode.switch.mount(pingProto)
+      let destNode = nodes[^1]
+      let pingProto = Ping.new(rng = rng())
+      destNode.switch.mount(pingProto)
 
-    startAndDeferStop(nodes)
+      startAndDeferStop(nodes)
 
-    let conn = nodes[0]
-      .toConnection(
-        MixDestination.exitNode(destNode.switch.peerInfo.peerId),
-        pingProto.codec,
-        MixParameters(expectReply: Opt.some(true), numSurbs: Opt.some(byte(1))),
-      )
-      .expect("could not build connection")
+      let conn = nodes[0]
+        .toConnection(
+          MixDestination.exitNode(destNode.switch.peerInfo.peerId),
+          pingProto.codec,
+          MixParameters(expectReply: Opt.some(true), numSurbs: Opt.some(byte(1))),
+        )
+        .expect("could not build connection")
 
-    let response = await pingProto.ping(conn)
-    await conn.close()
+      let response = await pingProto.ping(conn)
+      await conn.close()
 
-    check response != 0.seconds
+      check response != 0.seconds
 
   asyncTest "length-prefixed protocol - verify readLp fix":
     ## This test verifies the fix for the length prefix bug where responses

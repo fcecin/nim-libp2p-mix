@@ -116,7 +116,7 @@ let response = await conn.readLp(maxBytes)
 `MixDestination` selects the delivery mode per request:
 
 - `MixDestination.forwardToAddr(peerId, multiAddr)` or `MixDestination.init(...)` sends to an external destination through a randomly selected exit node. If `expectReply` is true, provide `readSpec` so the exit knows how to read the external response.
-- `MixDestination.exitNode(peerId)` sends to a Mix node that is also the destination. The final node runs its mounted protocol handler directly, so `readSpec` is not required even when expecting replies.
+- `MixDestination.exitNode(peerId)` sends to a Mix node that is also the destination. This experimental MixNode mode is controlled by `-d:libp2p_mix_experimental_exit_is_dest`, which is enabled by default in this repository. The final node runs its mounted protocol handler directly, so `readSpec` is not required even when expecting replies.
 
 For a complete worked example, see [`examples/mix_ping.nim`](examples/mix_ping.nim).
 
@@ -238,6 +238,7 @@ default SAT solver can't resolve the transitive git pins libp2p brings in.
 |---|---|
 | `-d:metrics` | Enable Prometheus-style metric counters (test-time default). |
 | `-d:enable_mix_benchmarks` | Compile in benchmark/timing helpers from `libp2p_mix/benchmark.nim`. |
+| `-d:libp2p_mix_experimental_exit_is_dest` | Enable experimental MixNode destination mode via `MixDestination.exitNode(...)`; enabled by default in `config.nims`. |
 
 ## License
 

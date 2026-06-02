@@ -313,7 +313,7 @@ See `libp2p_mix.nimble` for authoritative constraints. Notable dependencies:
 ### Integration with libp2p Switch
 - `MixProtocol` is mounted on a libp2p `Switch`.
 - Ensure integration code remains compatible with the `libp2p >= 1.15.3` constraint.
-- `MixDestination` selects delivery mode per request: `forwardToAddr`/`init` for external destinations, `exitNode` for a Mix node that is also the destination.
+- `MixDestination` selects delivery mode per request: `forwardToAddr`/`init` for external destinations, `exitNode` for a Mix node that is also the destination when `-d:libp2p_mix_experimental_exit_is_dest` is enabled. The flag is enabled by default in `config.nims`.
 - Forwarded destinations that expect replies must provide `MixReadSpec`; exit-node destinations run local protocol handlers and do not require `MixReadSpec`.
 
 ### Spam protection

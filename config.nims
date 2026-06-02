@@ -4,6 +4,8 @@
   error
 --mm:
   refc
+--d:
+  libp2p_mix_experimental_exit_is_dest
 
 # Allow `import libp2p_mix/X` and `import ./tools/X` from any subdirectory
 switch("path", thisDir())
