@@ -34,13 +34,8 @@ jobs:
       - name: Install deps
         run: nimble install -dy
 
-      # --solver:legacy is required on every nimble task invocation while
-      # libp2p_mix.nimble pins libp2p to a git commit. nimble's default
-      # SAT solver can't resolve multiple transitive git pins (libp2p +
-      # its boringssl/websock/jwt pins) and re-resolves deps on each
-      # task call. Drop the flag once libp2p_mix pins libp2p by version.
       - name: Set up project paths
-        run: nimble --solver:legacy setup
+        run: nimble setup
 
       - name: Build mix_ping
-        run: nimble --solver:legacy example
+        run: nimble example

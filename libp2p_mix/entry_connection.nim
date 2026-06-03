@@ -68,7 +68,7 @@ method readOnce*(
   return toRead
 
 method write*(
-    self: MixEntryConnection, msg: seq[byte]
+    self: MixEntryConnection, msg: sink seq[byte]
 ): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
   if msg.len() > DataSize:
     raise newException(LPStreamError, "exceeds max msg size of " & $DataSize & " bytes")

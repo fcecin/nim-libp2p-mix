@@ -61,10 +61,14 @@ proc add*(pool: MixNodePool, info: MixPubInfo) =
   ## keys set by the Identify protocol).
   pool.peerStore[MixPubKeyBook][info.peerId] = info.mixPubKey
 
-  # Add address if not already present
+  # Add address if not already present.
+  # Infinite confidence prevents the libp2p v2.0.0 1h auto-prune from
+  # evicting mix node addresses we curated from discovery/static config.
   let existingAddrs = pool.peerStore[AddressBook][info.peerId]
   if info.multiAddr notin existingAddrs:
-    pool.peerStore[AddressBook][info.peerId] = existingAddrs & @[info.multiAddr]
+    pool.peerStore[AddressBook].set(
+      info.peerId, existingAddrs & @[info.multiAddr], AddressConfidence.Infinite
+    )
 
   # Only set key if peer has no key yet
   let existingKey = pool.peerStore[KeyBook][info.peerId]

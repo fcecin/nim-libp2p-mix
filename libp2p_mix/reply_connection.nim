@@ -20,7 +20,7 @@ method readExactly*(
   raise newException(LPStreamError, "MixReplyConnection does not allow reading")
 
 method write*(
-    self: MixReplyConnection, msg: seq[byte]
+    self: MixReplyConnection, msg: sink seq[byte]
 ): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
   if msg.len() > DataSize:
     raise newException(LPStreamError, "exceeds max msg size of " & $DataSize & " bytes")

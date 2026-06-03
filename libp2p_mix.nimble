@@ -8,12 +8,17 @@ description =
 license = "MIT"
 skipDirs = @["examples", "tests"]
 
-# Pin nim-libp2p master until a release is tagged.
-# CI uses `--solver:legacy` for `nimble setup` (libp2p's boringssl is git-pinned).
-requires "nim >= 2.0.0",
-  "https://github.com/vacp2p/nim-libp2p.git#d4cd68b91b82f34a0ede3766ab1ca8119d5015f8",
-  "chronicles >= 0.11.0", "chronos >= 4.2.2", "metrics", "nimcrypto >= 0.6.0",
-  "stew >= 0.4.2", "results", "unittest2"
+requires "nim >= 2.2.4",
+  # Pinned to release/v2.0.0 tip (3 patch commits past the v2.0.0 commit).
+  # vacp2p/nim-libp2p has no v2.0.0 git tag yet; SHA-pin until they publish one.
+  "https://github.com/vacp2p/nim-libp2p.git#c43199378f46d0aaf61be1cad1ee1d63e8f665d6",
+  "chronicles >= 0.11.0",
+  "chronos >= 4.2.2",
+  "metrics",
+  "nimcrypto >= 0.6.0",
+  "stew >= 0.4.2",
+  "results",
+  "unittest2"
 
 import os, strutils
 
