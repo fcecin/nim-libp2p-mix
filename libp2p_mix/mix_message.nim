@@ -32,6 +32,14 @@ proc init*(
 ): T =
   return T(message: @message, codec: codec, readSpec: readSpec)
 
+proc init*(
+    T: typedesc[MixMessage],
+    message: sink seq[byte],
+    codec: string,
+    readSpec: MixReadSpec = DefaultMixReadSpec,
+): T =
+  return T(message: move(message), codec: codec, readSpec: readSpec)
+
 proc decodeLeb128[T: SomeUnsignedInt](
     data: openArray[byte], offset: int, field: string
 ): Result[tuple[value: T, len: int], string] =
