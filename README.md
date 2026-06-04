@@ -48,7 +48,8 @@ tests/                    Unit tests
   └── tools/              Test helpers (vendored from nim-libp2p tests/tools/)
 
 examples/
-  └── mix_ping.nim        End-to-end demo: ping over a 10-node mix network
+  ├── mix_ping_forward.nim End-to-end demo: ping through a forwarded exit
+  └── mix_ping_mix_node.nim End-to-end demo: ping a mix node destination
 
 config.nims               Project-wide compiler config (--mm:refc, paths)
 tests/config.nims         Test-only defines (-d:metrics, libp2p subsystems)
@@ -118,7 +119,8 @@ let response = await conn.readLp(maxBytes)
 - `MixDestination.forwardToAddr(peerId, multiAddr)` or `MixDestination.init(...)` sends to an external destination through a randomly selected exit node. If `expectReply` is true, provide `readSpec` so the exit knows how to read the external response.
 - `MixDestination.exitNode(peerId)` sends to a Mix node that is also the destination. The final node runs its mounted protocol handler directly, so `readSpec` is not required even when expecting replies.
 
-For a complete worked example, see [`examples/mix_ping.nim`](examples/mix_ping.nim).
+For complete worked examples, see [`examples/mix_ping_forward.nim`](examples/mix_ping_forward.nim)
+and [`examples/mix_ping_mix_node.nim`](examples/mix_ping_mix_node.nim).
 
 ### Pluggable spam protection
 
@@ -156,23 +158,17 @@ let mix = MixProtocol.new(
 
 ## Building & running
 
-The package depends on `nim-libp2p`. While we're not yet on a published
-release, point at a local clone with `nimble develop`:
+To setep the project run:
 
 ```bash
-git clone https://github.com/vacp2p/nim-libp2p.git
 git clone https://github.com/logos-co/nim-libp2p-mix.git
 cd nim-libp2p-mix
-git -C ../nim-libp2p checkout d4cd68b91b82f34a0ede3766ab1ca8119d5015f8
-nimble develop --add=../nim-libp2p   # registers libp2p as a develop dep
 nimble setup -l --solver:legacy       # generates nimble.paths using local deps
 ```
 
-Use Nim 2.2.4 or newer: the pinned `nim-libp2p` revision requires it. The
-`nim-libp2p` checkout must match the revision pinned in `libp2p_mix.nimble`.
-`-l` keeps dependency checkouts project-local under `nimbledeps/`.
+The `-l` option keeps dependencies project-local under `nimbledeps/`.
 `--solver:legacy` is currently required because Nimble's default SAT solver
-cannot resolve the git-pinned transitive dependencies from `nim-libp2p`.
+cannot resolve the git-pinned (transitive) dependencies.
 
 ### Tests
 
@@ -188,12 +184,12 @@ The `tests/config.nims` enables `-d:metrics` and several
 ### Example
 
 ```bash
-nimble example
+nimble exampleForward
+nimble exampleMixNode
 ```
 
-This compiles `examples/mix_ping.nim`, which spins up 10 mix nodes locally,
-mounts the libp2p `Ping` protocol on an external destination, sends a ping
-through a randomly selected exit node, and waits for the reply via SURBs.
+These compile the forwarded-destination and mix-node-destination ping examples.
+`nimble example` remains an alias for `nimble exampleForward`.
 Expected output:
 
 ```
@@ -203,8 +199,8 @@ INF Ping response received through mix network rtt=41ms…
 To build the binary without auto-cleanup:
 
 ```bash
-nim c -d:metrics -o:mix_ping examples/mix_ping.nim
-./mix_ping
+nim c -d:metrics -o:mix_ping_forward examples/mix_ping_forward.nim
+./mix_ping_forward
 ```
 
 ### Nix

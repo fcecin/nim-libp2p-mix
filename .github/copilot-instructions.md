@@ -45,7 +45,8 @@ nim-libp2p-mix/
 │   ├── tools/                 # Test helpers (vendored/extracted from nim-libp2p)
 │   └── config.nims            # Test-only defines (metrics + libp2p metric subsystems)
 ├── examples/
-│   └── mix_ping.nim           # End-to-end demo: ping over a mix network
+│   ├── mix_ping_forward.nim   # End-to-end demo: forwarded destination ping
+│   └── mix_ping_mix_node.nim  # End-to-end demo: mix node destination ping
 ├── libp2p_mix.nimble          # Package metadata and nimble tasks
 └── config.nims                # Project-wide compiler config (style, mm:refc, paths)
 ```
