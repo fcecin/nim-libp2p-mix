@@ -32,10 +32,9 @@ jobs:
           key: nimble-examples-${{ hashFiles('libp2p_mix.nimble') }}
 
       - name: Install deps
-        run: nimble install -dy
-
-      - name: Set up project paths
-        run: nimble setup
+        # Matches the logos-delivery (waku) recipe — avoids strict lockfile
+        # `nim` checksum validation that breaks `nimble install -dy`.
+        run: nimble setup --localdeps -y
 
       - name: Build mix_ping
         run: nimble example

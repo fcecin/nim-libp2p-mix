@@ -30,7 +30,8 @@ jobs:
           - { os: linux, builder: ubuntu-22.04, cpu: i386,  cc: gcc }
           - { os: macos, builder: macos-15,     cpu: arm64, cc: clang }
         nim:
-          - { ref: '2.0.16', mm: refc }
+          # libp2p v2.0.0 requires nim >= 2.2.4 transitively, so 2.0.16 is
+          # no longer compatible — drop it from the matrix.
           - { ref: '2.2.6',  mm: refc }
 
     name: ${{ matrix.platform.os }}-${{ matrix.platform.cpu }} (Nim ${{ matrix.nim.ref }})
@@ -72,10 +73,12 @@ jobs:
         run: |
           nim --version
           nimble --version
-          nimble install -dy
-
-      - name: Set up project paths
-        run: nimble setup
+          # `nimble setup --localdeps -y` mirrors the logos-delivery (waku)
+          # recipe: it provisions into a project-local `nimbledeps/` and is
+          # tolerant of platform drift in the lockfile's `nim` checksum.
+          # `nimble install -dy` would re-validate every lock entry strictly
+          # and fail on the Nim entry checksum mismatch.
+          nimble setup --localdeps -y
 
       - name: Run unit tests
         run: nimble test
