@@ -13,6 +13,9 @@ type MixMessage* = object
 proc init*(T: typedesc[MixMessage], message: openArray[byte], codec: string): T =
   return T(message: @message, codec: codec)
 
+proc init*(T: typedesc[MixMessage], message: sink seq[byte], codec: string): T =
+  return T(message: move(message), codec: codec)
+
 proc serialize*(mixMsg: MixMessage): seq[byte] =
   let vbytes = toBytes(mixMsg.codec.len.uint64, Leb128)
   doAssert vbytes.len <= 2, "serialization failed: codec length exceeds 2 bytes"

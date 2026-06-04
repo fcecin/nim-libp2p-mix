@@ -11,7 +11,7 @@ from fragmentation import DataSize
 const DefaultSurbs = uint8(4)
 
 type MixDialer* = proc(
-  msg: seq[byte], codec: string, destination: MixDestination
+  msg: sink seq[byte], codec: string, destination: MixDestination
 ): Future[void] {.async: (raises: [CancelledError, LPStreamError]).}
 
 type MixParameters* = object
@@ -72,7 +72,7 @@ method write*(
 ): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
   if msg.len() > DataSize:
     raise newException(LPStreamError, "exceeds max msg size of " & $DataSize & " bytes")
-  await self.mixDialer(msg, self.codec, self.destination)
+  await self.mixDialer(move(msg), self.codec, self.destination)
 
 proc shortLog*(self: MixEntryConnection): string {.raises: [].} =
   "[MixEntryConnection] Destination: " & $self.destination
@@ -111,10 +111,10 @@ proc new*(
     instance.incomingFut = checkForIncoming()
 
   instance.mixDialer = proc(
-      msg: seq[byte], codec: string, dest: MixDestination
+      msg: sink seq[byte], codec: string, dest: MixDestination
   ): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
     let sendRes = await srcMix.anonymizeLocalProtocolSend(
-      instance.incoming, msg, codec, dest, numSurbs
+      instance.incoming, move(msg), codec, dest, numSurbs
     )
     if sendRes.isErr:
       raise newException(LPStreamError, sendRes.error)

@@ -45,7 +45,7 @@ proc init*(
 
 proc replyDialerCbFactory(self: ExitLayer): MixReplyDialer =
   return proc(
-      surbs: seq[SURB], msg: seq[byte]
+      surbs: seq[SURB], msg: sink seq[byte]
   ): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
     let respFuts = surbs.mapIt(self.onReplyDialer(it, msg))
     await allFutures(respFuts)

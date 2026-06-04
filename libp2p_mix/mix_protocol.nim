@@ -589,7 +589,7 @@ proc buildSurbs(
 proc prepareMsgWithSurbs(
     mixProto: MixProtocol,
     incoming: AsyncQueue[seq[byte]],
-    msg: seq[byte],
+    msg: sink seq[byte],
     numSurbs: uint8 = 0,
     destPeerId: PeerId,
     exitPeerId: PeerId,
@@ -653,10 +653,10 @@ proc sendPacket(
   return ok()
 
 proc buildMessage(
-    msg: seq[byte], codec: string, peerId: PeerId
+    msg: sink seq[byte], codec: string, peerId: PeerId
 ): Result[Message, (string, string)] =
   let
-    mixMsg = MixMessage.init(msg, codec)
+    mixMsg = MixMessage.init(move(msg), codec)
     serialized = mixMsg.serialize()
 
   if serialized.len > DataSize:
@@ -703,7 +703,7 @@ proc init*(T: typedesc[MixDestination], p: PeerId, address: MultiAddress): T =
 proc anonymizeLocalProtocolSend*(
     mixProto: MixProtocol,
     incoming: AsyncQueue[seq[byte]],
-    msg: seq[byte],
+    msg: sink seq[byte],
     codec: string,
     destination: MixDestination,
     numSurbs: uint8,
@@ -843,12 +843,12 @@ proc anonymizeLocalProtocolSend*(
     else:
       Hop()
 
-  let msgWithSurbs = mixProto.prepareMsgWithSurbs(
-    incoming, msg, numSurbs, destination.peerId, exitPeerId
+  var msgWithSurbs = mixProto.prepareMsgWithSurbs(
+    incoming, move(msg), numSurbs, destination.peerId, exitPeerId
   ).valueOr:
     return err(fmt"Could not prepend SURBs: {error}")
 
-  let message = buildMessage(msgWithSurbs, codec, mixProto.mixNodeInfo.peerId).valueOr:
+  let message = buildMessage(move(msgWithSurbs), codec, mixProto.mixNodeInfo.peerId).valueOr:
     mix_messages_error.inc(labelValues = ["Entry", error[1]])
     return err(fmt"Error building message: {error[0]}")
 
