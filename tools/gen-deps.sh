@@ -63,6 +63,7 @@ jq -c '
   .packages
   | to_entries[]
   | select(.value.downloadMethod == "git")
+  | select(.key != "nim")
 ' "$LOCKFILE" | while read -r entry; do
   name=$(jq -r '.key' <<<"$entry")
   url=$(jq -r '.value.url' <<<"$entry")

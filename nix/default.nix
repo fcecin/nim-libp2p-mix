@@ -1,4 +1,4 @@
-{ pkgs, src }:
+{ pkgs, src, toolchain ? import ./toolchain.nix { inherit pkgs; } }:
 
 let
   deps = import ./deps.nix { inherit pkgs; };
@@ -13,9 +13,9 @@ pkgs.stdenv.mkDerivation {
   inherit src;
 
   nativeBuildInputs = [
-    pkgs.nim-2_2
+    toolchain.nim
     pkgs.git
-    pkgs.nimble
+    toolchain.nimble
   ];
 
   buildPhase = ''

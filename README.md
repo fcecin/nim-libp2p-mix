@@ -196,11 +196,14 @@ nim c -d:libp2p_mix_experimental_exit_is_dest -d:metrics -o:mix_ping examples/mi
 
 ### Nix
 
-A flake is provided for reproducible dev shells and builds.
+A flake is provided for reproducible dev shells and builds. It uses the
+repo-local source-built toolchain definition in `nix/toolchain.nix`, currently
+pinning Nim `2.2.10` and Nimble `0.22.3` instead of relying on the versions
+bundled by the pinned `nixpkgs` input.
 
 ```bash
-nix develop          # drops you into a shell with nim 2.2 + nimble
-nix build .#default  # type-checks libp2p_mix.nim against locked deps
+nix develop  # shell with pinned Nim/Nimble and dependency-generation tools
+nix build    # type-checks libp2p_mix.nim against locked deps
 ```
 
 The flake reads `nix/deps.nix`, which is the **committed** snapshot of all
@@ -211,9 +214,9 @@ pinned transitive dependencies. Refresh it after bumping the libp2p pin in
 make deps   # regenerates nix/deps.nix
 ```
 
-`make deps` requires `nix-prefetch-git` and `jq` on `$PATH`. Internally it
-runs `nimble --solver:legacy lock` to produce a fresh `nimble.lock` and
-then transforms it via `tools/gen-deps.sh`.
+`make deps` requires `nix-prefetch-git` and `jq` on `$PATH`; both are provided
+by `nix develop`. Internally it runs `nimble --solver:legacy lock` to produce a
+fresh `nimble.lock` and then transforms it via `tools/gen-deps.sh`.
 
 `nimble.lock` itself is **not** committed — it's an intermediate build
 artefact regenerated on demand (it lives in `.gitignore`). The long-lived

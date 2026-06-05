@@ -24,9 +24,10 @@
       packages = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
+          toolchain = import ./nix/toolchain.nix { inherit pkgs; };
         in {
           default = import ./nix/default.nix {
-            inherit pkgs;
+            inherit pkgs toolchain;
             src = ./.;
           };
         }
@@ -35,12 +36,24 @@
       devShells = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };
+          toolchain = import ./nix/toolchain.nix { inherit pkgs; };
         in {
           default = pkgs.mkShell {
             nativeBuildInputs = [
-              pkgs.nim-2_2
-              pkgs.nimble
+              toolchain.nim
+              toolchain.nimble
+              pkgs.git
+              pkgs.jq
               pkgs.makeWrapper
+              pkgs.nix-prefetch-git
+              pkgs.openssl
+              pkgs.pcre
+              pkgs.readline
+              pkgs.sqlite
+              pkgs.stdenv.cc
+            ];
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+              pkgs.openssl
             ];
           };
         }
