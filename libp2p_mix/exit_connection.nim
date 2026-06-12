@@ -23,7 +23,7 @@ method readOnce*(
   nbytes
 
 method write*(
-    self: MixExitConnection, msg: seq[byte]
+    self: MixExitConnection, msg: sink seq[byte]
 ): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
   if msg.len() > DataSize:
     raise newException(LPStreamError, "exceeds max msg size of " & $DataSize & " bytes")
@@ -40,6 +40,9 @@ method initStream*(self: MixExitConnection) =
 
 method closeImpl*(self: MixExitConnection): Future[void] {.async: (raises: []).} =
   discard
+
+method getWrapped*(self: MixExitConnection): Connection =
+  nil
 
 func hash*(self: MixExitConnection): Hash =
   discard

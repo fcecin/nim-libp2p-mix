@@ -22,25 +22,27 @@ jobs:
       - name: Setup Nim
         uses: jiro4989/setup-nim-action@v2
         with:
-          nim-version: '2.2.6'
+          # Matches the "current" Nim in ci.yml's matrix. ci.yml also covers
+          # the 2.2.4 floor on full unit/component tests; for examples we
+          # just smoke-build against the version most contributors run.
+          nim-version: '2.2.10'
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cache nimble deps
         uses: actions/cache@v5
         with:
-          path: ~/.nimble
+          # `nimble setup --localdeps -y` (below) provisions deps into the
+          # project-local `nimbledeps/`, so cache both that and `~/.nimble`.
+          path: |
+            ~/.nimble
+            nimbledeps
           key: nimble-examples-${{ hashFiles('libp2p_mix.nimble') }}
 
       - name: Install deps
-        run: nimble install -dy
-
-      # --solver:legacy is required on every nimble task invocation while
-      # libp2p_mix.nimble pins libp2p to a git commit. nimble's default
-      # SAT solver can't resolve multiple transitive git pins (libp2p +
-      # its boringssl/websock/jwt pins) and re-resolves deps on each
-      # task call. Drop the flag once libp2p_mix pins libp2p by version.
-      - name: Set up project paths
-        run: nimble --solver:legacy setup
+        # Project-local install: provisions deps into `nimbledeps/` and
+        # generates `nimble.paths`. We don't commit `nimble.lock` (see #13),
+        # so `nimble setup --localdeps -y` is the right bootstrap.
+        run: nimble setup --localdeps -y
 
       - name: Build mix_ping
-        run: nimble --solver:legacy example
+        run: nimble example

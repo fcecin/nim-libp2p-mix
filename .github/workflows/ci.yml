@@ -30,8 +30,14 @@ jobs:
           - { os: linux, builder: ubuntu-22.04, cpu: i386,  cc: gcc }
           - { os: macos, builder: macos-15,     cpu: arm64, cc: clang }
         nim:
-          - { ref: '2.0.16', mm: refc }
-          - { ref: '2.2.6',  mm: refc }
+          # libp2p v2.0.0 requires nim >= 2.2.4 transitively, so 2.0.16 is
+          # no longer compatible. We test both the floor and current:
+          # - 2.2.4 is the libp2p v2.0.0 minimum and the version this PR
+          #   was validated against locally;
+          # - 2.2.10 is the current 2.2.x and ships nimble 0.22.3, which
+          #   is what most contributors will have on their host machines.
+          - { ref: '2.2.4',  mm: refc }
+          - { ref: '2.2.10', mm: refc }
 
     name: ${{ matrix.platform.os }}-${{ matrix.platform.cpu }} (Nim ${{ matrix.nim.ref }})
     runs-on: ${{ matrix.platform.builder }}
@@ -65,25 +71,26 @@ jobs:
         id: nimble-cache
         uses: actions/cache@v5
         with:
-          path: ~/.nimble
+          # `nimble setup --localdeps -y` (below) provisions deps into the
+          # project-local `nimbledeps/`, so cache both that and `~/.nimble`
+          # (which holds nimble's package metadata + downloaded tarballs).
+          path: |
+            ~/.nimble
+            nimbledeps
           key: nimble-${{ matrix.platform.os }}-${{ matrix.platform.cpu }}-${{ matrix.nim.ref }}-${{ hashFiles('libp2p_mix.nimble') }}
 
       - name: Install deps
         run: |
           nim --version
           nimble --version
-          nimble install -dy
-
-      # --solver:legacy is required on every nimble task invocation while
-      # libp2p_mix.nimble pins libp2p to a git commit. nimble's default
-      # SAT solver can't resolve multiple transitive git pins (libp2p +
-      # its boringssl/websock/jwt pins) and re-resolves deps on each
-      # task call. Drop the flag once libp2p_mix pins libp2p by version.
-      - name: Set up project paths
-        run: nimble --solver:legacy setup
+          # Project-local install: provisions deps into `nimbledeps/` and
+          # generates `nimble.paths`. We don't commit `nimble.lock` (see
+          # #13), so `nimble setup --localdeps -y` is the right bootstrap
+          # (vs `nimble install -dy`, which would expect a committed lock).
+          nimble setup --localdeps -y
 
       - name: Run unit tests
-        run: nimble --solver:legacy test
+        run: nimble test
 
       - name: Run component tests
-        run: nimble --solver:legacy testComponent
+        run: nimble testComponent
