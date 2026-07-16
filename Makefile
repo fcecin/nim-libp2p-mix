@@ -10,23 +10,21 @@ all: build
 setup:
 	nimble setup -l $(NIMBLE_FLAGS)
 
-# `nimble.lock` is an intermediate build artefact, not committed to git
-# (see .gitignore and issue #13). It's regenerated here from
-# `libp2p_mix.nimble` only as input to `./tools/gen-deps.sh`, which
-# produces the committed `nix/deps.nix`. The Nim-matrix CI jobs install
-# deps via `make setup NIMBLE_FLAGS="$NIMBLE_FLAGS"`, with `NIMBLE_FLAGS`
-# defined once at workflow level, and don't read `nimble.lock`;
-# only the `ci / nix` job regenerates `nimble.lock` on the fly (via
-# `make deps`) and uses it as input to `gen-deps.sh`.
-nimble.lock: libp2p_mix.nimble
-	nimble lock $(NIMBLE_FLAGS)
-
-nix/deps.nix: nimble.lock tools/gen-deps.sh
-	NIMBLE_FLAGS='$(NIMBLE_FLAGS)' ./tools/gen-deps.sh nimble.lock nix/deps.nix
-
-deps: nix/deps.nix
-
-build: deps
+# `nix/deps.nix` is a committed pin — an exact rev + sha256 per dependency —
+# and `nix build` consumes it as-is. Building never regenerates it.
+#
+# That is deliberate: regenerating runs `nimble lock`, which re-resolves the
+# open version ranges in `libp2p_mix.nimble` ("chronos >= 4.2.2", plus
+# everything transitive via libp2p) to each dependency's current
+# default-branch HEAD. Those HEADs move daily, so making the pin a build
+# dependency meant an ordinary `make build` could silently repin the whole
+# tree — which is how the committed pin kept drifting out from under CI.
+# Refresh it deliberately with `make refresh-deps`, then commit the result.
+#
+# `nimble.lock` is an intermediate artefact of that refresh, not committed
+# (see .gitignore and issue #13). The Nim-matrix CI jobs provision deps with
+# `make setup NIMBLE_FLAGS="$NIMBLE_FLAGS"` and never read it.
+build:
 	nix build
 
 format:
@@ -38,6 +36,11 @@ clean:
 clean-nimbledeps:
 	$(RMDIR) nimbledeps nimble.paths
 
+# Re-resolve dependency ranges and rewrite the committed pin. Run this when
+# bumping a dependency in `libp2p_mix.nimble`, then commit `nix/deps.nix`.
 refresh-deps:
 	$(RMDIR) nimble.lock
-	$(MAKE) deps
+	nimble lock $(NIMBLE_FLAGS)
+	NIMBLE_FLAGS='$(NIMBLE_FLAGS)' ./tools/gen-deps.sh nimble.lock nix/deps.nix
+
+deps: refresh-deps

@@ -237,41 +237,36 @@ nix develop          # drops you into a shell with nim 2.2 + nimble
 nix build            # type-checks libp2p_mix.nim against locked deps
 ```
 
-The flake reads `nix/deps.nix`, which is the **committed** snapshot of all
-pinned transitive dependencies. Refresh it after bumping the libp2p pin in
-`libp2p_mix.nimble`:
+The flake reads `nix/deps.nix`, the **committed pin**: an exact rev and
+sha256 for every transitive dependency. `nix build` and `make build` consume
+it as-is and never regenerate it, so builds are reproducible and don't depend
+on what upstream happens to be doing today.
 
-```bash
-make deps   # regenerates nix/deps.nix
-```
-
-If you need to force regeneration from a clean intermediate lock file, run:
-
-```bash
-make refresh-deps
-```
-
-`NIMBLE_FLAGS` can be passed to `make refresh-deps` the same way as
-`make setup`; command-line variables are forwarded to the recursive
-`make deps` invocation:
+Refresh the pin deliberately, after bumping a dependency in
+`libp2p_mix.nimble`, and commit the result:
 
 ```bash
 make refresh-deps NIMBLE_FLAGS="-y"
 ```
 
-`NIMBLE_FLAGS` can also be passed to `make build` when dependency generation
-may be triggered as part of the build:
+`NIMBLE_FLAGS` is forwarded to `nimble lock`. Include `-y` to keep the
+resolution non-interactive — without it nimble can stop to prompt and hang an
+unattended run.
 
-```bash
-make build NIMBLE_FLAGS="-y"
-```
+Note that a refresh re-resolves the open version ranges in
+`libp2p_mix.nimble` — `chronos >= 4.2.2`, plus everything reached
+transitively through libp2p — against each dependency's current
+default-branch HEAD. It will therefore repin dependencies you did not
+intend to touch. That is expected: review the resulting diff, and only
+commit it when you actually mean to move those pins.
 
-For predictable forced regeneration, prefer `make refresh-deps`; `make build`
-only uses `NIMBLE_FLAGS` if `nimble.lock` or `nix/deps.nix` need to be
-regenerated.
+CI does not regenerate `nix/deps.nix`. It checks that the libp2p rev in the
+pin matches the version `libp2p_mix.nimble` requires
+(`tools/check-libp2p-pin.sh`) and that the pin builds. See issue #13 for the
+history here.
 
-If this does not work for any reason and you need to start fresh while in the Nix shell
-(so after the initial `nix develop`), run:
+If you need to start fresh while in the Nix shell (so after the initial
+`nix develop`), run:
 
 ```bash
 make clean
