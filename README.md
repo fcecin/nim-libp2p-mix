@@ -181,6 +181,23 @@ nimble testAll         # both
 The `tests/config.nims` enables `-d:metrics` and several
 `libp2p_*_metrics` defines so tests can assert on metric counters.
 
+### Formatting
+
+```bash
+make format
+```
+
+`make format` runs `nph` over tracked Nim files. It assumes `nph` version
+`0.7.0` is installed globally in the native shell, matching CI:
+
+```bash
+nimble -y install nph@0.7.0
+```
+
+Check the installed package version with `nimble dump nph` and look for
+`version: "0.7.0"`. The `nph --version` output may still show a prerelease
+string for this release, so prefer the Nimble package metadata.
+
 ### Example
 
 ```bash
@@ -239,8 +256,19 @@ make refresh-deps
 `make deps` invocation:
 
 ```bash
-make refresh-deps NIMBLE_FLAGS="-y --solver:legacy"
+make refresh-deps NIMBLE_FLAGS="-y"
 ```
+
+`NIMBLE_FLAGS` can also be passed to `make build` when dependency generation
+may be triggered as part of the build:
+
+```bash
+make build NIMBLE_FLAGS="-y"
+```
+
+For predictable forced regeneration, prefer `make refresh-deps`; `make build`
+only uses `NIMBLE_FLAGS` if `nimble.lock` or `nix/deps.nix` need to be
+regenerated.
 
 If this does not work for any reason and you need to start fresh while in the Nix shell
 (so after the initial `nix develop`), run:
@@ -251,6 +279,14 @@ make setup
 make refresh-deps
 nix build
 ```
+
+optionally including `NIMBLE_FLAGS="-y"` if necessary.
+
+`--solver:legacy` was needed while `libp2p` was pinned as a git dependency.
+Now that `libp2p_mix.nimble` requires an ordinary published version
+(`libp2p == 2.1.4`), nimble's default solver resolves it, and CI passes only
+`-y`. The `make setup` example above still shows the flag to document that
+the option exists.
 
 To quickly check that you are in the nix shell run:
 
