@@ -308,6 +308,16 @@ proc computeTag(s: FieldElement): Tag =
   ## Compute replay detection tag as H(s) per spec Section 8.6.1 Step 2.
   sha256_hash(fieldElementToBytes(s))
 
+proc computeSharedSecret(
+    alphaFE: FieldElement, privateKey: FieldElement
+): Result[FieldElement, string] =
+  # Low-order public inputs collapse X25519 output to zero; reject after multiplication
+  # because that is the point where the subgroup check is observable for X25519.
+  let s = multiplyPointWithScalars(alphaFE, [privateKey])
+  if s.isZeroFieldElement():
+    return err("Invalid alpha: low-order shared secret")
+  ok(s)
+
 proc checkReplay*(
     sphinxPacket: SphinxPacket, privateKey: FieldElement, tm: var TagManager
 ): Result[tuple[isReplay: bool, sharedSecret: FieldElement], string] =
@@ -319,10 +329,11 @@ proc checkReplay*(
     (alpha, _, _) = header.get()
 
   # Compute shared secret
-  let alphaFE = bytesToFieldElement(alpha).valueOr:
-    return err("Error in bytes to field element conversion: " & error)
+  let alphaFE = bytesToAlphaFieldElement(alpha).valueOr:
+    return err("Invalid alpha: " & error)
 
-  let s = multiplyPointWithScalars(alphaFE, [privateKey])
+  let s = computeSharedSecret(alphaFE, privateKey).valueOr:
+    return err(error)
 
   # Compute tag as H(s) per spec
   let tag = computeTag(s)
@@ -339,11 +350,17 @@ proc processSphinxPacket*(
     (header, payload) = sphinxPacket.get()
     (alpha, beta, gamma) = header.get()
 
-  # Compute shared secret (or reuse if provided)
+  # Validate alpha encoding even when sharedSecret is supplied; alpha still
+  # drives MAC and blinding.
+  let alphaFE = bytesToAlphaFieldElement(alpha).valueOr:
+    return err("Invalid alpha: " & error)
+
   let s = sharedSecret.valueOr:
-    let alphaFE = bytesToFieldElement(alpha).valueOr:
-      return err("Error in bytes to field element conversion: " & error)
-    multiplyPointWithScalars(alphaFE, [privateKey])
+    computeSharedSecret(alphaFE, privateKey).valueOr:
+      return err(error)
+
+  if s.isZeroFieldElement():
+    return err("Invalid alpha: low-order shared secret")
 
   let sBytes = fieldElementToBytes(s)
 
@@ -416,9 +433,6 @@ proc processSphinxPacket*(
 
     # Compute alpha
     let blinder = bytesToFieldElement(sha256_hash(alpha & sBytes)).valueOr:
-      return err("Error in bytes to field element conversion: " & error)
-
-    let alphaFE = bytesToFieldElement(alpha).valueOr:
       return err("Error in bytes to field element conversion: " & error)
 
     let alpha_prime = multiplyPointWithScalars(alphaFE, [blinder])
