@@ -25,9 +25,10 @@ method generateForIntermediate*(
 
 method generateForSender*(self: DelayStrategy): Delay {.base, gcsafe, raises: [].} =
   ## Sample the pre-send hold applied by the sender before the first hop write
-  ## (mix.md §8.5.2 step 3.f). Same distribution family as per-hop delays,
-  ## independent of the values encoded in the packet.
-  raiseAssert "generateForSender must be implemented by concrete delay strategy types"
+  ## (mix.md §8.5.2 step 3.f). Default reuses entry + intermediate so custom
+  ## strategies that only implement those two methods keep working. Override
+  ## when the sender hold needs a different distribution (e.g. independent mean).
+  self.generateForIntermediate(self.generateForEntry())
 
 type NoSamplingDelayStrategy* = ref object of DelayStrategy
   ## Lab/test strategy: generates random delays [0-2]ms, uses them directly.
@@ -44,9 +45,6 @@ method generateForIntermediate*(
     self: NoSamplingDelayStrategy, encodedDelay: Delay
 ): Delay {.gcsafe, raises: [].} =
   encodedDelay
-
-method generateForSender*(self: NoSamplingDelayStrategy): Delay {.gcsafe, raises: [].} =
-  self.generateForEntry()
 
 const DefaultMeanDelay*: Delay = 100
 const DefaultNegligibleProb* = 1e-6

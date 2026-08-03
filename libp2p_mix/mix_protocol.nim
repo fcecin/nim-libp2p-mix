@@ -633,17 +633,34 @@ proc sendPacket(
   ## first-hop write to break burst timing correlation.
 
   let label = $logConfig.logType
-
-  # Per-hop spam protection: Generate initial proof and append to packet
-  let (packetToSend, _) = mixProto.generateAndAppendProof(
-    sphinxPacket.serialize(), label
-  ).valueOr:
-    return err(error)
+  let serialized = sphinxPacket.serialize()
 
   # §8.5.2 step 3.f: hold before first-hop transmit (entry and SURB replies).
+  # Overlap proof generation with the hold, same as the intermediate path, so
+  # spam-proof work does not stack on top of the sampled delay.
   let initialDelay = mixProto.delayStrategy.generateForSender()
-  if initialDelay != NoDelay:
-    await sleepAsync(initialDelay.toDuration)
+  let proofGenStartTime = Moment.now()
+  let delayFut = sleepAsync(initialDelay.toDuration)
+
+  let proofGenFut = (
+    proc(): Future[Result[tuple[packet: seq[byte], proofToken: seq[byte]], string]] {.
+        async
+    .} =
+      return mixProto.generateAndAppendProof(serialized, label)
+  )()
+
+  await allFutures(proofGenFut, delayFut)
+
+  mixProto.spamProtection.withValue(sp):
+    let proofGenTimeMs = (Moment.now() - proofGenStartTime).milliseconds
+    if proofGenTimeMs > initialDelay.int64:
+      warn "Proof generation time exceeds sampled sender delay",
+        proofGenTimeMs,
+        sampledDelay = initialDelay,
+        hint = "Increase the minimum delay floor or reduce proof generation time"
+
+  let (packetToSend, _) = proofGenFut.value().valueOr:
+    return err(error)
 
   when defined(enable_mix_benchmarks):
     if logConfig.logType == Entry:

@@ -52,6 +52,16 @@ proc sampleLowerBoundStats(
 
   (minimumDelayHits, sawDelayAboveMinimum)
 
+type EntryOnlyStrategy = ref object of DelayStrategy
+  ## Test-only: implements entry/intermediate only; relies on base generateForSender.
+  fixed: Delay
+
+method generateForEntry*(self: EntryOnlyStrategy): Delay =
+  self.fixed
+
+method generateForIntermediate*(self: EntryOnlyStrategy, encodedDelay: Delay): Delay =
+  encodedDelay + 1
+
 suite "DelayStrategy":
   test "NoSamplingDelayStrategy generateForEntry returns values in [0, 2]":
     let strategy = NoSamplingDelayStrategy.new(rng())
@@ -71,6 +81,10 @@ suite "DelayStrategy":
 
     for _ in 0 ..< NumIterations:
       check strategy.generateForSender() <= 2
+
+  test "generateForSender default uses entry then intermediate":
+    let strategy = EntryOnlyStrategy(fixed: 10)
+    check strategy.generateForSender() == 11
 
   test "ExponentialDelayStrategy generateForEntry returns configured mean":
     let rng = rng()

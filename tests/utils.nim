@@ -195,6 +195,3 @@ method generateForEntry*(self: FixedDelayStrategy): Delay =
 
 method generateForIntermediate*(self: FixedDelayStrategy, encodedDelay: Delay): Delay =
   self.delay
-
-method generateForSender*(self: FixedDelayStrategy): Delay =
-  self.delay
