@@ -628,7 +628,9 @@ proc sendPacket(
     sphinxPacket: SphinxPacket,
     logConfig: SendPacketLogConfig,
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
-  ## Send the wrapped message to the first mix node in the selected path
+  ## Send the wrapped message to the first mix node in the selected path.
+  ## Applies the sender pre-send delay (mix.md §8.5.2 step 3.f) before the
+  ## first-hop write to break burst timing correlation.
 
   let label = $logConfig.logType
 
@@ -637,6 +639,11 @@ proc sendPacket(
     sphinxPacket.serialize(), label
   ).valueOr:
     return err(error)
+
+  # §8.5.2 step 3.f: hold before first-hop transmit (entry and SURB replies).
+  let initialDelay = mixProto.delayStrategy.generateForSender()
+  if initialDelay != NoDelay:
+    await sleepAsync(initialDelay.toDuration)
 
   when defined(enable_mix_benchmarks):
     if logConfig.logType == Entry:
@@ -1038,6 +1045,9 @@ proc init*(
   ## When `spamProtection` is enabled, callers should prefer
   ## `SpamProtectionDelayStrategy` to avoid timing correlation between proof
   ## generation and short exponential delays.
+  ##
+  ## Default delay strategy is `ExponentialDelayStrategy` (mean 100 ms for both
+  ## per-hop encoding and the sender pre-send hold).
 
   doAssert not switch.rng.isNil, "Switch must have RNG initialized"
 
@@ -1050,7 +1060,7 @@ proc init*(
 
   mixProto.spamProtection = spamProtection
   mixProto.delayStrategy = delayStrategy.valueOr:
-    NoSamplingDelayStrategy.new(switch.rng)
+    ExponentialDelayStrategy.new(rng = switch.rng)
 
   mixProto.coverTraffic = coverTraffic
   coverTraffic.withValue(ct):

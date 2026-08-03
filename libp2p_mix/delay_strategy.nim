@@ -23,8 +23,15 @@ method generateForIntermediate*(
   ## implementation should return some default value in case of errors
   raiseAssert "generateForIntermediate must be implemented by concrete delay strategy types"
 
+method generateForSender*(self: DelayStrategy): Delay {.base, gcsafe, raises: [].} =
+  ## Sample the pre-send hold applied by the sender before the first hop write
+  ## (mix.md §8.5.2 step 3.f). Same distribution family as per-hop delays,
+  ## independent of the values encoded in the packet.
+  raiseAssert "generateForSender must be implemented by concrete delay strategy types"
+
 type NoSamplingDelayStrategy* = ref object of DelayStrategy
-  ## Default strategy: generates random delays [0-2]ms, uses them directly.
+  ## Lab/test strategy: generates random delays [0-2]ms, uses them directly.
+  ## Not suitable for production anonymity; prefer ExponentialDelayStrategy.
 
 proc new*(T: typedesc[NoSamplingDelayStrategy], rng: Rng): T =
   doAssert(rng != nil, "random is not set")
@@ -38,6 +45,9 @@ method generateForIntermediate*(
 ): Delay {.gcsafe, raises: [].} =
   encodedDelay
 
+method generateForSender*(self: NoSamplingDelayStrategy): Delay {.gcsafe, raises: [].} =
+  self.generateForEntry()
+
 const DefaultMeanDelay*: Delay = 100
 const DefaultNegligibleProb* = 1e-6
   ## Probability below which the tail of the exponential distribution is
@@ -50,13 +60,18 @@ const DefaultMinimumDelay*: Delay = 0
 const DefaultSpamProtectionDelayFloor*: Delay = 100
   ## Recommended default lower bound when per-hop spam protection is enabled.
   ## Use `SpamProtectionDelayStrategy` to apply this floor explicitly.
+const DefaultInitialMeanDelay*: Delay = DefaultMeanDelay
+  ## Default mean for the sender pre-send hold (§8.5.2 step 3.f). Independent of
+  ## the per-hop mean encoded in the packet; both default to DefaultMeanDelay.
 
 type ExponentialDelayStrategy* = ref object of DelayStrategy
-  ## Recommended strategy: encodes mean delay, samples from exponential distribution.
+  ## Default production strategy: encodes mean delay for hops, samples from an
+  ## exponential at intermediates and for the sender pre-send hold.
   ## Samples are drawn directly from the exponential distribution conditioned on
   ## the configured [minimumDelay, practicalMaxDelay] window. This preserves
   ## a smooth bounded distribution without fixed spikes at either bound.
   meanDelay: Delay
+  initialMeanDelay: Delay
   negligibleProb: float64
   minimumDelay: Delay
 
@@ -71,6 +86,7 @@ proc new*(
     rng: Rng,
     negligibleProb: float64 = DefaultNegligibleProb,
     minimumDelay: Delay = DefaultMinimumDelay,
+    initialMeanDelay: Delay = DefaultInitialMeanDelay,
 ): T {.raises: [].} =
   doAssert(rng != nil, "random is not set")
   doAssert(
@@ -78,6 +94,7 @@ proc new*(
   )
   T(
     meanDelay: meanDelay,
+    initialMeanDelay: initialMeanDelay,
     rng: rng,
     negligibleProb: negligibleProb,
     minimumDelay: minimumDelay,
@@ -89,6 +106,7 @@ proc new*(
     rng: Rng,
     negligibleProb: float64 = DefaultNegligibleProb,
     minimumDelay: Delay = DefaultSpamProtectionDelayFloor,
+    initialMeanDelay: Delay = DefaultInitialMeanDelay,
 ): T {.raises: [].} =
   doAssert(rng != nil, "random is not set")
   doAssert(
@@ -96,6 +114,7 @@ proc new*(
   )
   T(
     meanDelay: meanDelay,
+    initialMeanDelay: initialMeanDelay,
     rng: rng,
     negligibleProb: negligibleProb,
     minimumDelay: minimumDelay,
@@ -142,3 +161,10 @@ method generateForIntermediate*(
     return self.minimumDelay
 
   self.sampleTruncatedExponential(encodedDelay, minDelay, maxDelay)
+
+method generateForSender*(
+    self: ExponentialDelayStrategy
+): Delay {.gcsafe, raises: [].} =
+  ## Sender pre-send hold (mix.md §8.5.2 step 3.f): same family as per-hop
+  ## delays, mean chosen independently of the values encoded for intermediates.
+  self.generateForIntermediate(self.initialMeanDelay)
