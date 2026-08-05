@@ -93,7 +93,7 @@ jobs:
         run: |
           run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           existing=$(gh issue list --label nix-ci-failure --state open \
-            --json number --jq '.[0].number')
+            --limit 1 --json number --jq '.[0].number // empty')
           if [ -n "$existing" ]; then
             gh issue comment "$existing" \
               --body "Still failing: $run_url (event: ${{ github.event_name }})"
