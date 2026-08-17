@@ -95,6 +95,13 @@ proc claimSlot*(pool: SlotPool): ClaimResult =
     token = discarded.proofToken
   ClaimResult(success: true, reclaimedToken: token)
 
+proc unclaimSlot*(pool: SlotPool) =
+  ## Refund a non-cover slot for a packet that never reached the wire.
+  ## Callers must ensure any proof generated for the packet is reclaimed
+  ## alongside, so claimed slots stay in step with consumed proof messageIds.
+  if pool.nonCoverClaimed > 0:
+    pool.nonCoverClaimed -= 1
+
 func totalSlots*(pool: SlotPool): int {.inline.} =
   pool.totalSlots
 
