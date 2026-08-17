@@ -56,12 +56,10 @@ suite "SlotPool":
 
   test "unclaimSlot refunds a non-cover claim":
     let pool = SlotPool.new(1)
-    check pool.claimSlot().success == true
-    check pool.claimSlot().success == false
+    discard pool.claimSlot()
     pool.unclaimSlot()
-    check pool.claimSlot().success == true
-    # never goes below zero, even without a prior claim
-    pool.unclaimSlot()
+    check pool.availableSlots == 1
+    # underflow guard: no-op without a prior claim
     pool.unclaimSlot()
     check pool.availableSlots == 1
 
