@@ -54,6 +54,17 @@ suite "SlotPool":
     check pool.claimSlot().success == false
     check pool.claimSlotForCover() == false
 
+  test "unclaimSlot refunds a non-cover claim":
+    let pool = SlotPool.new(1)
+    check pool.claimSlot().success == true
+    check pool.claimSlot().success == false
+    pool.unclaimSlot()
+    check pool.claimSlot().success == true
+    # never goes below zero, even without a prior claim
+    pool.unclaimSlot()
+    pool.unclaimSlot()
+    check pool.availableSlots == 1
+
   test "beginEpoch refills pool and clears stale packets":
     let pool = SlotPool.new(10)
     let (pid, ma) = makePeerInfo()
