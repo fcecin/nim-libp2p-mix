@@ -906,7 +906,8 @@ proc anonymizeLocalProtocolSend*(
 
   # Send the wrapped message to the first mix node in the selected path
   (await mixProto.sendPacket(nextHopPeerId, nextHopAddr, sphinxPacket, logConfig)).isOkOr:
-    # sendPacket reclaimed the proof, so the slot can be refunded too
+    # The packet never reached the wire; sendPacket reclaims the proof token
+    # when one was generated, so refunding the slot cannot double-spend a proof
     mixProto.coverTraffic.withValue(ct):
       ct.slotPool.unclaimSlot()
     releaseAndFail(error)
@@ -944,7 +945,8 @@ proc reply(
   )
   if sendRes.isErr:
     error "could not send reply", peerId, multiAddr, err = sendRes.error
-    # sendPacket reclaimed the proof, so the slot can be refunded too
+    # The packet never reached the wire; sendPacket reclaims the proof token
+    # when one was generated, so refunding the slot cannot double-spend a proof
     mixProto.coverTraffic.withValue(ct):
       ct.slotPool.unclaimSlot()
 
