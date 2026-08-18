@@ -135,9 +135,11 @@ A reference RLN-based implementation lives in
 ### Cover traffic & delay strategies
 
 By default `MixProtocol` uses `ExponentialDelayStrategy` (mean 100 ms) for
-per-hop delays and the sender pre-send hold (mix.md §8.5.2 step 3.f). Override
-only when you need a different mean, spam-protection floor, or a lab-only
-strategy such as `NoSamplingDelayStrategy`.
+per-hop delays and the sender pre-send hold (mix.md §8.5.2 step 3.f). When
+`spamProtection` is enabled the default is `SpamProtectionDelayStrategy`
+instead, which adds a 100 ms delay floor so proof generation cannot set the
+send time. Override only when you need a different mean, a different floor, or
+a lab-only strategy such as `NoSamplingDelayStrategy`.
 
 ```nim
 let ct = ConstantRateCoverTraffic.new(

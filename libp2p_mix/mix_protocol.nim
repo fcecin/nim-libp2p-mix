@@ -416,19 +416,23 @@ method handleMixMessages*(
     let proofGenStartTime = Moment.now()
     let delayFut = sleepAsync(actualDelay.toDuration)
 
+    # proofGenTimeMs is captured at proof completion, inside the closure, so it
+    # measures proof cost alone — not max(proof, delay) as after allFutures.
+    var proofGenTimeMs: int64
     let proofGenFut = (
       proc(): Future[Result[tuple[packet: seq[byte], proofToken: seq[byte]], string]] {.
           async
       .} =
-        return mixProto.generateAndAppendProof(
+        let res = mixProto.generateAndAppendProof(
           processedSP.serializedSphinxPacket, "Intermediate"
         )
+        proofGenTimeMs = (Moment.now() - proofGenStartTime).milliseconds
+        return res
     )()
 
     await allFutures(proofGenFut, delayFut)
 
     mixProto.spamProtection.withValue(sp):
-      let proofGenTimeMs = (Moment.now() - proofGenStartTime).milliseconds
       if proofGenTimeMs > actualDelay.int64:
         warn "Proof generation time exceeds sampled delay",
           proofGenTimeMs,
@@ -642,17 +646,21 @@ proc sendPacket(
   let proofGenStartTime = Moment.now()
   let delayFut = sleepAsync(initialDelay.toDuration)
 
+  # proofGenTimeMs is captured at proof completion, inside the closure, so it
+  # measures proof cost alone — not max(proof, delay) as after allFutures.
+  var proofGenTimeMs: int64
   let proofGenFut = (
     proc(): Future[Result[tuple[packet: seq[byte], proofToken: seq[byte]], string]] {.
         async
     .} =
-      return mixProto.generateAndAppendProof(serialized, label)
+      let res = mixProto.generateAndAppendProof(serialized, label)
+      proofGenTimeMs = (Moment.now() - proofGenStartTime).milliseconds
+      return res
   )()
 
   await allFutures(proofGenFut, delayFut)
 
   mixProto.spamProtection.withValue(sp):
-    let proofGenTimeMs = (Moment.now() - proofGenStartTime).milliseconds
     if proofGenTimeMs > initialDelay.int64:
       warn "Proof generation time exceeds sampled sender delay",
         proofGenTimeMs,
@@ -1059,12 +1067,11 @@ proc init*(
   ## Mix node public keys should be populated via the nodePool after
   ## initialization using `mixProto.nodePool.add(mixPubInfo)`.
   ##
-  ## When `spamProtection` is enabled, callers should prefer
-  ## `SpamProtectionDelayStrategy` to avoid timing correlation between proof
-  ## generation and short exponential delays.
-  ##
   ## Default delay strategy is `ExponentialDelayStrategy` (mean 100 ms for both
-  ## per-hop encoding and the sender pre-send hold).
+  ## per-hop encoding and the sender pre-send hold). When `spamProtection` is
+  ## enabled the default is `SpamProtectionDelayStrategy` instead (same means,
+  ## 100 ms delay floor) so proof generation time cannot dominate short sampled
+  ## delays and set the send time.
 
   doAssert not switch.rng.isNil, "Switch must have RNG initialized"
 
@@ -1077,7 +1084,10 @@ proc init*(
 
   mixProto.spamProtection = spamProtection
   mixProto.delayStrategy = delayStrategy.valueOr:
-    ExponentialDelayStrategy.new(rng = switch.rng)
+    if spamProtection.isSome:
+      DelayStrategy(SpamProtectionDelayStrategy.new(rng = switch.rng))
+    else:
+      DelayStrategy(ExponentialDelayStrategy.new(rng = switch.rng))
 
   mixProto.coverTraffic = coverTraffic
   coverTraffic.withValue(ct):
