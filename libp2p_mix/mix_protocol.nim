@@ -506,34 +506,72 @@ proc getMaxMessageSizeForCodec*(
     return err("cannot encode messages for this codec")
   return ok(DataSize - totalLen)
 
+proc selectReplyHops*(
+    mixProto: MixProtocol,
+    destPeerId: PeerId,
+    exitPeerId: PeerId,
+    replyAnchor: Opt[PeerId],
+): Result[seq[PeerId], string] {.gcsafe, raises: [].} =
+  ## Picks the intermediary nodes of a return path, in order from the exit
+  ## towards the sender: `PathLength - 1` pool nodes, without the exit and the
+  ## destination. The sender itself is not in the result.
+  ##
+  ## With a reply anchor, the last hop of the result, the one that delivers
+  ## the reply to the sender, is the anchor, and the other hops do not repeat
+  ## it. A reply anchor is a pool node the sender keeps a connection to. The
+  ## hop before the sender delivers the reply by dialing the sender's address,
+  ## and libp2p reuses an existing connection before it dials. A sender that
+  ## nothing can dial (a device behind NAT) receives a reply only over a
+  ## connection it opened itself, so it names the peer at the other end of
+  ## such a connection as the anchor. Without an anchor, every hop is random.
+  if mixProto.nodePool.len < PathLength:
+    return err("No. of public mix nodes less than path length")
+
+  var candidates =
+    mixProto.nodePool.peerIds().filterIt(it != exitPeerId and it != destPeerId)
+  var randomCount = PathLength - 1
+  replyAnchor.withValue(anchor):
+    if anchor == exitPeerId or anchor == destPeerId:
+      return err("reply anchor is the exit node or the destination")
+    if anchor notin candidates:
+      return err("reply anchor is not in the mix node pool")
+    candidates.keepItIf(it != anchor)
+    randomCount.dec()
+  if candidates.len < randomCount:
+    return err("not enough mix nodes for a return path")
+
+  var hops: seq[PeerId] = @[]
+  for _ in 0 ..< randomCount:
+    let position = cryptoRandomInt(mixProto.rng, candidates.len).valueOr:
+      return err("failed to generate random num: " & error)
+    hops.add(candidates[position])
+    candidates.del(position)
+  replyAnchor.withValue(anchor):
+    hops.add(anchor)
+  ok(hops)
+
 method buildSurb*(
-    mixProto: MixProtocol, id: SURBIdentifier, destPeerId: PeerId, exitPeerId: PeerId
+    mixProto: MixProtocol,
+    id: SURBIdentifier,
+    destPeerId: PeerId,
+    exitPeerId: PeerId,
+    replyAnchor: Opt[PeerId],
 ): Result[SURB, string] {.base, gcsafe, raises: [].} =
   var
     publicKeys: seq[FieldElement] = @[]
     hops: seq[Hop] = @[]
     delays: seq[Delay] = @[]
 
-  if mixProto.nodePool.len < PathLength:
-    return err("No. of public mix nodes less than path length")
+  let replyPeers = mixProto.selectReplyHops(destPeerId, exitPeerId, replyAnchor).valueOr:
+    return err(error)
 
-  # Remove exit and dest node from nodes to consider for surbs
-  var poolPeerIds =
-    mixProto.nodePool.peerIds().filterIt(it != exitPeerId and it != destPeerId)
-  var availableIndices = toSeq(0 ..< poolPeerIds.len)
-
-  # Select L mix nodes at random
   for i in 0 ..< PathLength:
     let (peerId, multiAddr, mixPubKey, hopDelay) =
       if i < PathLength - 1:
-        let randomIndexPosition = cryptoRandomInt(mixProto.rng, availableIndices.len).valueOr:
-          return err("failed to generate random num: " & error)
-        let selectedIndex = availableIndices[randomIndexPosition]
-        let randPeerId = poolPeerIds[selectedIndex]
-        availableIndices.del(randomIndexPosition)
-        debug "Selected mix node for surbs: ", indexInPath = i, peerId = randPeerId
-        let mixPubInfo = mixProto.nodePool.get(randPeerId).valueOr:
-          return err("could not get mix pub info for peer: " & $randPeerId)
+        let hopPeerId = replyPeers[i]
+        debug "Selected mix node for surbs: ", indexInPath = i, peerId = hopPeerId
+        let mixPubInfo = mixProto.nodePool.get(hopPeerId).valueOr:
+          return err("could not get mix pub info for peer: " & $hopPeerId)
         (
           mixPubInfo.peerId,
           mixPubInfo.multiAddr,
@@ -564,6 +602,7 @@ proc buildSurbs(
     numSurbs: uint8,
     destPeerId: PeerId,
     exitPeerId: PeerId,
+    replyAnchor: Opt[PeerId],
 ): Result[tuple[surbs: seq[SURB], session: Opt[SurbSession]], string] =
   if numSurbs == 0:
     # Fire-and-forget send: no reply expected, so nothing to register.
@@ -579,7 +618,7 @@ proc buildSurbs(
     var id: SURBIdentifier
     mixProto.rng.generate(id)
 
-    let surb = mixProto.buildSurb(id, destPeerId, exitPeerId).valueOr:
+    let surb = mixProto.buildSurb(id, destPeerId, exitPeerId, replyAnchor).valueOr:
       # Release whatever this group already registered; a partially built
       # group can never receive a usable reply.
       session.release()
@@ -608,8 +647,11 @@ proc prepareMsgWithSurbs(
     numSurbs: uint8 = 0,
     destPeerId: PeerId,
     exitPeerId: PeerId,
+    replyAnchor: Opt[PeerId],
 ): Result[tuple[msg: seq[byte], session: Opt[SurbSession]], string] =
-  let built = mixProto.buildSurbs(incoming, numSurbs, destPeerId, exitPeerId).valueOr:
+  let built = mixProto.buildSurbs(
+    incoming, numSurbs, destPeerId, exitPeerId, replyAnchor
+  ).valueOr:
     return err(error)
   let serialized = serializeMessageWithSURBs(msg, built.surbs).valueOr:
     built.session.get(nil).release()
@@ -749,12 +791,18 @@ proc anonymizeLocalProtocolSend*(
     codec: string,
     destination: MixDestination,
     numSurbs: uint8,
+    replyAnchor: Opt[PeerId] = Opt.none(PeerId),
 ): Future[Result[Opt[SurbSession], string]] {.
     async: (raises: [CancelledError, LPStreamError])
 .} =
   ## On success returns a handle to the reply credentials registered for this
   ## send (or `Opt.none` when `numSurbs == 0`), so the caller can release them
   ## promptly when its connection closes.
+  ##
+  ## `replyAnchor` names the pool node that delivers the reply to this node
+  ## on every return path (see `selectReplyHops`). The forward path does not
+  ## change. The send fails when the anchor is not in the pool, or is the
+  ## exit node or the destination of this send.
   when not defined(libp2p_mix_experimental_exit_is_dest):
     doAssert destination.kind == ForwardAddr, "Only exit != destination is allowed"
 
@@ -884,7 +932,7 @@ proc anonymizeLocalProtocolSend*(
       Hop()
 
   var prepared = mixProto.prepareMsgWithSurbs(
-    incoming, move(msg), numSurbs, destination.peerId, exitPeerId
+    incoming, move(msg), numSurbs, destination.peerId, exitPeerId, replyAnchor
   ).valueOr:
     return err(fmt"Could not prepend SURBs: {error}")
 

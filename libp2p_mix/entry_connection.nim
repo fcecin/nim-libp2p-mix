@@ -3,6 +3,7 @@
 
 import hashes, chronos, results, chronicles, metrics
 import libp2p/stream/connection
+import libp2p/peerid
 import libp2p/varint
 import ./[mix_protocol, mix_metrics, surb_store]
 from padding import DataSize
@@ -26,6 +27,12 @@ type MixParameters* = object
   replyTimeout*: Opt[Duration]
     ## `none` applies a default of 30 seconds. Pass
     ## `Opt.some(InfiniteDuration)` to wait indefinitely.
+  replyAnchor*: Opt[PeerId]
+    ## A pool node that delivers the reply to this node on every return path,
+    ## so the reply arrives over the connection this node keeps to it. For a
+    ## node that nothing can dial (behind NAT). `none` leaves that hop random.
+    ## The anchor must be in the pool and must not be the exit node or the
+    ## destination of the send.
 
 type MixEntryConnection* = ref object of Connection
   destination: MixDestination
@@ -159,6 +166,7 @@ proc new*(
   instance.destination = destination
   instance.codec = codec
   instance.replyTimeout = params.replyTimeout.get(DefaultReplyTimeout)
+  let replyAnchor = params.replyAnchor
 
   if expectReply:
     instance.incoming = newAsyncQueue[seq[byte]]()
@@ -173,7 +181,7 @@ proc new*(
   ): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
     let session = (
       await srcMix.anonymizeLocalProtocolSend(
-        instance.incoming, move(msg), codec, dest, numSurbs
+        instance.incoming, move(msg), codec, dest, numSurbs, replyAnchor
       )
     ).valueOr:
       raise newException(LPStreamError, error)

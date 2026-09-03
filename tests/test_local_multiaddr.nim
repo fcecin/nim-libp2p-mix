@@ -95,7 +95,9 @@ suite "setLocalMultiAddr":
 
     var id: SURBIdentifier
     rng().generate(id)
-    let surb = mix.buildSurb(id, destInfo.peerId, exitInfo.peerId).expect("build SURB")
+    let surb = mix
+      .buildSurb(id, destInfo.peerId, exitInfo.peerId, Opt.none(PeerId))
+      .expect("build SURB")
 
     let firstHopPeerId =
       bytesToMultiAddr(surb.hop.get()).expect("decode SURB first hop")[0]

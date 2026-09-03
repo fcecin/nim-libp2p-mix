@@ -39,6 +39,33 @@ suite "Mix Protocol - Message Delivery":
 
     check response != 0.seconds
 
+  asyncTest "expect reply, exit != destination, with a reply anchor":
+    ## The anchor delivers the reply to the sender. Here every node is
+    ## reachable, so the test shows that the anchor does not break delivery;
+    ## the position of the anchor on the return path is a unit test.
+    let nodes = await setupMixNodes(
+      10, destReadBehavior = Opt.some((codec: PingCodec, callback: readExactly(32)))
+    )
+    startAndDeferStop(nodes)
+    let (destNode, pingProto) = await setupDestNode(Ping.new(rng = rng()))
+    defer:
+      await stopDestNode(destNode)
+    let anchor = nodes[5].switch.peerInfo.peerId
+    let conn = nodes[0]
+      .toConnection(
+        destNode.toMixDestination(),
+        pingProto.codec,
+        MixParameters(
+          expectReply: Opt.some(true),
+          numSurbs: Opt.some(byte(1)),
+          replyAnchor: Opt.some(anchor),
+        ),
+      )
+      .expect("could not build connection")
+    let response = await pingProto.ping(conn)
+    await conn.close()
+    check response != 0.seconds
+
   asyncTest "expect no reply, exit != destination":
     let nodes = await setupMixNodes(10)
     startAndDeferStop(nodes)
