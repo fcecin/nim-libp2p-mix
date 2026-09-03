@@ -8,6 +8,7 @@ import libp2p/[protocols/ping, peerid, switch, builders]
 import libp2p_mix
 import libp2p_mix/mix_protocol
 import libp2p_mix/delay_strategy
+import libp2p_mix/[entry_connection, sphinx]
 
 import ../tools/[lifecycle, unittest, crypto]
 import ../utils
@@ -38,6 +39,111 @@ suite "Mix Protocol - Message Delivery":
     await conn.close()
 
     check response != 0.seconds
+
+  asyncTest "expect reply, exit != destination, with a reply anchor":
+    ## The anchor delivers the reply to the sender. Here every node is
+    ## reachable, so the test shows that the anchor does not break delivery;
+    ## the position of the anchor on the return path is a unit test.
+    let nodes = await setupMixNodes(
+      10, destReadBehavior = Opt.some((codec: PingCodec, callback: readExactly(32)))
+    )
+    startAndDeferStop(nodes)
+    let (destNode, pingProto) = await setupDestNode(Ping.new(rng = rng()))
+    defer:
+      await stopDestNode(destNode)
+    let anchor = nodes[5].switch.peerInfo.peerId
+    let conn = nodes[0]
+      .toConnection(
+        destNode.toMixDestination(),
+        pingProto.codec,
+        MixParameters(
+          expectReply: Opt.some(true),
+          numSurbs: Opt.some(byte(1)),
+          replyAnchor: Opt.some(anchor),
+        ),
+      )
+      .expect("could not build connection")
+    let response = await pingProto.ping(conn)
+    await conn.close()
+    check response != 0.seconds
+
+  asyncTest "the sent path is exposed and the avoided hops stay out of the next path":
+    ## A caller whose attempt got no reply names the hops of that attempt as
+    ## `avoidPeers`; with enough other pool nodes they stay out of the next
+    ## forward path. The path lists the hops and the exit node last.
+    let nodes = await setupMixNodes(
+      10, destReadBehavior = Opt.some((codec: PingCodec, callback: readExactly(32)))
+    )
+    startAndDeferStop(nodes)
+    let (destNode, pingProto) = await setupDestNode(Ping.new(rng = rng()))
+    defer:
+      await stopDestNode(destNode)
+    let pool = nodes[0].nodePool.peerIds()
+
+    let first = nodes[0]
+      .toConnection(
+        destNode.toMixDestination(),
+        pingProto.codec,
+        MixParameters(expectReply: Opt.some(true), numSurbs: Opt.some(byte(1))),
+      )
+      .expect("could not build connection")
+    check (await pingProto.ping(first)) != 0.seconds
+    let firstPath = MixEntryConnection(first).sentPath()
+    await first.close()
+    check:
+      firstPath.len == PathLength
+      firstPath.allIt(it in pool)
+      firstPath.deduplicate().len == PathLength
+
+    let avoided = firstPath[0 ..< PathLength - 1]
+    let second = nodes[0]
+      .toConnection(
+        destNode.toMixDestination(),
+        pingProto.codec,
+        MixParameters(
+          expectReply: Opt.some(true), numSurbs: Opt.some(byte(1)), avoidPeers: avoided
+        ),
+      )
+      .expect("could not build connection")
+    check (await pingProto.ping(second)) != 0.seconds
+    let secondPath = MixEntryConnection(second).sentPath()
+    await second.close()
+    check:
+      secondPath.len == PathLength
+      secondPath.allIt(it notin avoided)
+
+  asyncTest "with a small pool, as many avoided hops leave the path as the pool allows":
+    ## Five nodes: the sender and four others in its pool. Two avoided hops:
+    ## dropping both would leave two candidates, below the path length, so one
+    ## of them leaves and the other stays in the draw.
+    let nodes = await setupMixNodes(
+      5, destReadBehavior = Opt.some((codec: PingCodec, callback: readExactly(32)))
+    )
+    startAndDeferStop(nodes)
+    let (destNode, pingProto) = await setupDestNode(Ping.new(rng = rng()))
+    defer:
+      await stopDestNode(destNode)
+    let others = nodes[1 .. ^1].mapIt(it.switch.peerInfo.peerId)
+    let avoided = others[0 .. 1]
+    for _ in 0 ..< 8:
+      let conn = nodes[0]
+        .toConnection(
+          destNode.toMixDestination(),
+          pingProto.codec,
+          MixParameters(
+            expectReply: Opt.some(true),
+            numSurbs: Opt.some(byte(1)),
+            avoidPeers: avoided,
+          ),
+        )
+        .expect("could not build connection")
+      check (await pingProto.ping(conn)) != 0.seconds
+      let path = MixEntryConnection(conn).sentPath()
+      await conn.close()
+      # Three candidates remain for three positions, so every path holds
+      # exactly one avoided hop: the one the pool could not spare, drawn at
+      # random each time.
+      check path.filterIt(it in avoided).len == 1
 
   asyncTest "expect no reply, exit != destination":
     let nodes = await setupMixNodes(10)

@@ -9,6 +9,7 @@
 
 import std/[sequtils, tables]
 import results
+import chronos/timer
 import libp2p/peerstore
 import libp2p/peerid
 import libp2p/multiaddress
@@ -87,6 +88,28 @@ proc remove*(pool: MixNodePool, peerId: PeerId): bool =
   # Note: We only delete from MixPubKeyBook. The peer may still have
   # entries in AddressBook/KeyBook for other protocols.
 
+proc newestSupportedMultiaddr*(
+    entries: seq[AddressEntry],
+    live: seq[MultiAddress],
+    preferred = Opt.none(MultiAddress),
+): Opt[MultiAddress] =
+  ## The supported address with the latest `lastUpdated` among the entries
+  ## whose address is in `live` (the book's non-expired addresses). On a tie
+  ## `preferred` wins when it is one of them (the last outbound address), else
+  ## the first entry in book order.
+  var best = Opt.none(AddressEntry)
+  for entry in entries:
+    if entry.address notin live or not isSupportedMultiaddr(entry.address):
+      continue
+    if best.isNone() or entry.lastUpdated > best.get().lastUpdated or (
+      entry.lastUpdated == best.get().lastUpdated and
+      preferred == Opt.some(entry.address)
+    ):
+      best = Opt.some(entry)
+  if best.isNone():
+    return Opt.none(MultiAddress)
+  Opt.some(best.get().address)
+
 proc get*(pool: MixNodePool, peerId: PeerId): Opt[MixPubInfo] =
   ## Get MixPubInfo for a peer. Returns none if peer is not in the pool
   ## or if required information (address, key) is missing.
@@ -94,15 +117,19 @@ proc get*(pool: MixNodePool, peerId: PeerId): Opt[MixPubInfo] =
   if mixPubKey == default(Curve25519Key):
     return Opt.none(MixPubInfo)
 
-  # Get the address - prefer LastSeenOutboundBook, fall back to AddressBook
+  # Get the address: the most recently updated supported live entry of the
+  # AddressBook; the last outbound address wins a tie. A configured address
+  # has Infinite confidence and never expires, so without the recency rule a
+  # node that moved to a new port stays unreachable until restart, although
+  # discovery delivered the new address. An expired last outbound address is
+  # not in the live list and loses.
   # Mix protocol only supports IPv4 addresses with TCP or QUIC-v1 transports
-  var supportedAddr: MultiAddress
-  let lastSeenAddr = pool.peerStore[LastSeenOutboundBook][peerId]
-  if lastSeenAddr.isSome and isSupportedMultiaddr(lastSeenAddr.get):
-    supportedAddr = lastSeenAddr.get
-  else:
-    supportedAddr = findSupportedMultiaddr(pool.peerStore[AddressBook][peerId]).valueOr:
-      return Opt.none(MixPubInfo)
+  let supportedAddr = newestSupportedMultiaddr(
+    pool.peerStore[AddressBook].entries(peerId),
+    pool.peerStore[AddressBook][peerId],
+    pool.peerStore[LastSeenOutboundBook][peerId],
+  ).valueOr:
+    return Opt.none(MixPubInfo)
 
   let pubKey = pool.peerStore[KeyBook][peerId]
   if pubKey.scheme != Secp256k1:

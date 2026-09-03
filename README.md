@@ -107,6 +107,12 @@ let conn = mix.toConnection(
 ).valueOr:
   return err(error)
 
+# A node that nothing can dial (behind NAT) receives a reply only over a
+# connection it opened itself. Name the pool node at the other end of such a
+# connection as the reply anchor: it becomes the hop that delivers every reply.
+#   MixParameters(expectReply: Opt.some(true), numSurbs: Opt.some(1.byte),
+#                 replyAnchor: Opt.some(anchorPeerId))
+
 # Now write/read as usual — the mix layer handles Sphinx wrapping, routing,
 # and (when expectReply is set) collecting the response via SURBs.
 await conn.writeLp(requestBytes)

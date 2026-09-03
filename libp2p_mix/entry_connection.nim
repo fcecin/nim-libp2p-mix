@@ -3,6 +3,7 @@
 
 import hashes, chronos, results, chronicles, metrics
 import libp2p/stream/connection
+import libp2p/peerid
 import libp2p/varint
 import ./[mix_protocol, mix_metrics, surb_store]
 from padding import DataSize
@@ -26,6 +27,16 @@ type MixParameters* = object
   replyTimeout*: Opt[Duration]
     ## `none` applies a default of 30 seconds. Pass
     ## `Opt.some(InfiniteDuration)` to wait indefinitely.
+  replyAnchor*: Opt[PeerId]
+    ## A pool node that delivers the reply to this node on every return path,
+    ## so the reply arrives over the connection this node keeps to it. For a
+    ## node that nothing can dial (behind NAT). `none` leaves that hop random.
+    ## The anchor must be in the pool and must not be the exit node or the
+    ## destination of the send.
+  avoidPeers*: seq[PeerId]
+    ## Pool nodes to keep out of the forward path, as many of them as the pool
+    ## allows: the hops of an attempt that got no reply (see
+    ## `MixEntryConnection.sentPath`). For one attempt; do not accumulate.
 
 type MixEntryConnection* = ref object of Connection
   destination: MixDestination
@@ -39,6 +50,14 @@ type MixEntryConnection* = ref object of Connection
   replyTimeout: Duration
   sent: bool
   replySession: Opt[SurbSession]
+  sentPath: seq[PeerId]
+    ## The forward path of the packet that left: the hops and the exit node
+    ## last. Empty until the write.
+
+func sentPath*(conn: MixEntryConnection): seq[PeerId] =
+  ## The forward path of the packet that left through this connection: the
+  ## hops and the exit node last. Empty before the write.
+  conn.sentPath
 
 func shortLog*(conn: MixEntryConnection): string =
   if conn == nil:
@@ -159,6 +178,8 @@ proc new*(
   instance.destination = destination
   instance.codec = codec
   instance.replyTimeout = params.replyTimeout.get(DefaultReplyTimeout)
+  let replyAnchor = params.replyAnchor
+  let avoidPeers = params.avoidPeers
 
   if expectReply:
     instance.incoming = newAsyncQueue[seq[byte]]()
@@ -171,16 +192,17 @@ proc new*(
   instance.mixDialer = proc(
       msg: sink seq[byte], codec: string, dest: MixDestination
   ): Future[void] {.async: (raises: [CancelledError, LPStreamError]).} =
-    let session = (
+    let outcome = (
       await srcMix.anonymizeLocalProtocolSend(
-        instance.incoming, move(msg), codec, dest, numSurbs
+        instance.incoming, move(msg), codec, dest, numSurbs, replyAnchor, avoidPeers
       )
     ).valueOr:
       raise newException(LPStreamError, error)
 
     # At most one: a reply-expecting connection accepts a single write, and a
     # fire-and-forget one never registers credentials.
-    instance.replySession = session
+    instance.replySession = outcome.session
+    instance.sentPath = outcome.path
 
   instance
 
