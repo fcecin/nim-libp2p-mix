@@ -39,7 +39,19 @@ func isCoverTraffic*(msg: MixMessage): bool =
 ## network composed of participating libp2p nodes, known as mix nodes. Each message is
 ## routed independently in a stateless manner, allowing other libp2p protocols to selectively
 ## anonymize messages without modifying their core protocol behavior.
+type MixNodeRole* {.pure.} = enum
+  ## What the node does with the packets it receives.
+  Full ## An intermediary and an exit node, that also receives its own replies.
+  SenderOnly
+    ## A node that sends and receives its own replies only. A packet that
+    ## names it as an intermediary or an exit node is dropped. A device with
+    ## short connection windows (a phone behind NAT) cannot serve the
+    ## network, and a node that does not advertise its mix key does not
+    ## expect such packets; this is the "sender only" role of the
+    ## specification.
+
 type MixProtocol* = ref object of LPProtocol
+  role*: MixNodeRole
   mixNodeInfo: MixNodeInfo
   switch*: Switch
   nodePool*: MixNodePool
@@ -290,6 +302,15 @@ method handleMixMessages*(
 
   when defined(enable_mix_benchmarks):
     let metadata = Metadata.deserialize(metadataBytes)
+
+  if mixProto.role == MixNodeRole.SenderOnly and processedSP.status != Reply:
+    # The packet names this node as a hop or as the exit node. A sender-only
+    # node serves nobody: the packet is dropped here, after the replay check
+    # took its tag, so a replay of it is dropped the same way.
+    debug "Sender-only node received a packet to process as a hop, dropping",
+      peerId = mixProto.mixNodeInfo.peerId, status = processedSP.status
+    mix_messages_error.inc(labelValues = [$processedSP.status, "SENDER_ONLY"])
+    return
 
   case processedSP.status
   of Exit:
@@ -1107,8 +1128,15 @@ proc init*(
     delayStrategy: Opt[DelayStrategy] = Opt.none(DelayStrategy),
     coverTraffic: Opt[CoverTraffic] = Opt.none(CoverTraffic),
     surbStore: SurbStore = nil,
+    role: MixNodeRole = MixNodeRole.Full,
 ) {.raises: [].} =
   ## Initialize a MixProtocol instance.
+  ##
+  ## `role` says what the node does with the packets it receives: `Full`
+  ## (the default) serves as an intermediary and an exit node; `SenderOnly`
+  ## drops such packets and processes its own replies only. A consumer that
+  ## advertises the mix key of a `Full` node and hides that of a `SenderOnly`
+  ## node keeps the two roles consistent.
   ##
   ## A nil `surbStore` gets a default one. Defaulting to nil rather than
   ## `SurbStore.new()` keeps the constructor out of the parameter list, so
@@ -1137,6 +1165,7 @@ proc init*(
     "SURB credential TTL must not exceed the replay tag TTL"
 
   mixProto.mixNodeInfo = mixNodeInfo
+  mixProto.role = role
   mixProto.switch = switch
   mixProto.rng = switch.rng
   mixProto.nodePool = MixNodePool.new(switch.peerStore)
