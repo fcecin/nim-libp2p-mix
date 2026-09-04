@@ -51,6 +51,11 @@ type MixProtocol* = ref object of LPProtocol
     ## reply never arrives; see surb_store.nim.
   destReadBehaviors: TableRef[string, DestReadBehavior]
   connPool: Table[PeerId, Connection]
+  dialsInFlight: Table[PeerId, Future[Connection]]
+    ## The dial in progress for a peer that has no pooled connection yet.
+    ## A second request for the same peer waits for it instead of dialing
+    ## again: two dials made two streams, the second overwrote the pooled
+    ## one, and the first stayed open until the closed-connection sweep.
   spamProtection: Opt[SpamProtection]
   delayStrategy: DelayStrategy
   coverTraffic*: Opt[CoverTraffic]
@@ -84,6 +89,9 @@ proc setLocalMultiAddr*(
 proc surbCredsLen*(mixProto: MixProtocol): int =
   mixProto.surbStore.len
 
+proc dialsInFlightLen*(mixProto: MixProtocol): int =
+  mixProto.dialsInFlight.len
+
 proc cryptoRandomInt(rng: Rng, max: int): Result[int, string] =
   if max == 0:
     return err("Max cannot be zero.")
@@ -105,22 +113,37 @@ proc removeClosedConnections(
     if mixProto.connPool.pop(p, conn):
       await conn.close()
 
-proc getConn(
+proc getConn*(
     mixProto: MixProtocol,
     pid: PeerId,
     addrs: seq[MultiAddress],
     codecs: seq[string],
     forceNewStream: bool = false,
 ): Future[Connection] {.async: (raises: [DialFailedError, CancelledError]).} =
+  ## The pooled connection to `pid`, or one dial for it. Requests that
+  ## arrive while that dial is in flight wait for it and share its result.
   if forceNewStream:
     # GC all expired connections including the one used for `pid`
     await mixProto.removeClosedConnections(pid)
+  let pooled = mixProto.connPool.getOrDefault(pid)
+  if not pooled.isNil():
+    return pooled
+  let inFlight = mixProto.dialsInFlight.getOrDefault(pid)
+  if not inFlight.isNil():
+    # `join` waits without cancelling the dial when this waiter is cancelled.
+    await inFlight.join()
+    let shared = mixProto.connPool.getOrDefault(pid)
+    if not shared.isNil():
+      return shared
+    # The dial failed for its own caller; this caller gets its own attempt.
+  let dial = mixProto.switch.dial(pid, addrs, codecs)
+  mixProto.dialsInFlight[pid] = dial
   try:
-    return mixProto.connPool[pid]
-  except KeyError:
-    let c = await mixProto.switch.dial(pid, addrs, codecs)
+    let c = await dial
     mixProto.connPool[pid] = c
     return c
+  finally:
+    mixProto.dialsInFlight.del(pid)
 
 proc writeLp(
     mixProto: MixProtocol,
