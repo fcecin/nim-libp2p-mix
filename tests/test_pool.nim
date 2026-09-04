@@ -3,7 +3,7 @@
 
 {.used.}
 
-import results, sequtils
+import results, sequtils, std/os
 import libp2p/[crypto/crypto, crypto/secp, multiaddress, peerid, peerstore]
 import libp2p_mix/[mix_node, pool]
 import ./tools/unittest
@@ -195,9 +195,10 @@ suite "MixNodePool Tests":
     peerStore[MixPubKeyBook][pubInfo.peerId] = pubInfo.mixPubKey
     peerStore[KeyBook][pubInfo.peerId] =
       PublicKey(scheme: Secp256k1, skkey: pubInfo.libp2pPubKey)
-    peerStore[AddressBook][pubInfo.peerId] = @[addressBookAddr]
+    peerStore[AddressBook][pubInfo.peerId] = @[addressBookAddr, lastSeenAddr]
 
-    # When LastSeenOutboundBook has a supported address, prefer it
+    # When LastSeenOutboundBook has a supported address that the book still
+    # holds, prefer it over the other entries of the same age
     peerStore[LastSeenOutboundBook][pubInfo.peerId] = Opt.some(lastSeenAddr)
     check pool.get(pubInfo.peerId).get().multiAddr == lastSeenAddr
 
@@ -231,3 +232,48 @@ suite "MixNodePool Tests":
       pool.add(pubInfo)
 
     check pool.len == 4
+
+  test "get prefers the most recently updated supported address":
+    ## A configured address never expires. When discovery brings a newer
+    ## address for the same peer, the pool uses the newer one.
+    let pubInfo = mixNodes[0].toMixPubInfo()
+    pool.add(pubInfo)
+    let newer = MultiAddress.init("/ip4/127.0.0.1/tcp/4242").expect("multiaddr")
+    sleep(2)
+    # `set` stamps `now` on the addresses of its list; the configured
+    # address is absent from the list, and the book keeps it (Infinite
+    # confidence) with its older stamp.
+    peerStore[AddressBook].set(pubInfo.peerId, @[newer], AddressConfidence.Medium)
+    check:
+      pubInfo.multiAddr in peerStore[AddressBook][pubInfo.peerId]
+      pool.get(pubInfo.peerId).get().multiAddr == newer
+
+  test "get prefers a newer discovered address over the last outbound one":
+    ## The sender dialed the node at its old address; the node moved; discovery
+    ## delivered the new address with a newer stamp.
+    let pubInfo = mixNodes[0].toMixPubInfo()
+    pool.add(pubInfo)
+    peerStore[LastSeenOutboundBook][pubInfo.peerId] = Opt.some(pubInfo.multiAddr)
+    let newer = MultiAddress.init("/ip4/127.0.0.1/tcp/4343").expect("multiaddr")
+    sleep(2)
+    peerStore[AddressBook].set(pubInfo.peerId, @[newer], AddressConfidence.Medium)
+    check pool.get(pubInfo.peerId).get().multiAddr == newer
+
+  test "get keeps the last outbound address on a tie":
+    let pubInfo = mixNodes[0].toMixPubInfo()
+    let other = MultiAddress.init("/ip4/127.0.0.1/tcp/4444").expect("multiaddr")
+    peerStore[AddressBook].set(
+      pubInfo.peerId, @[other, pubInfo.multiAddr], AddressConfidence.Medium
+    )
+    pool.add(pubInfo)
+    peerStore[LastSeenOutboundBook][pubInfo.peerId] = Opt.some(pubInfo.multiAddr)
+    # Both entries carry the same stamp; the last outbound address wins.
+    check pool.get(pubInfo.peerId).get().multiAddr == pubInfo.multiAddr
+
+  test "get does not use an expired last outbound address":
+    let pubInfo = mixNodes[0].toMixPubInfo()
+    pool.add(pubInfo)
+    let gone = MultiAddress.init("/ip4/127.0.0.1/tcp/4545").expect("multiaddr")
+    # A last outbound address that the book does not hold any more.
+    peerStore[LastSeenOutboundBook][pubInfo.peerId] = Opt.some(gone)
+    check pool.get(pubInfo.peerId).get().multiAddr == pubInfo.multiAddr

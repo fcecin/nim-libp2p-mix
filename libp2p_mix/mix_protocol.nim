@@ -39,7 +39,19 @@ func isCoverTraffic*(msg: MixMessage): bool =
 ## network composed of participating libp2p nodes, known as mix nodes. Each message is
 ## routed independently in a stateless manner, allowing other libp2p protocols to selectively
 ## anonymize messages without modifying their core protocol behavior.
+type MixNodeRole* {.pure.} = enum
+  ## What the node does with the packets it receives.
+  Full ## An intermediary and an exit node, that also receives its own replies.
+  SenderOnly
+    ## A node that sends and receives its own replies only. A packet that
+    ## names it as an intermediary or an exit node is dropped. A device with
+    ## short connection windows (a phone behind NAT) cannot serve the
+    ## network, and a node that does not advertise its mix key does not
+    ## expect such packets; this is the "sender only" role of the
+    ## specification.
+
 type MixProtocol* = ref object of LPProtocol
+  role*: MixNodeRole
   mixNodeInfo: MixNodeInfo
   switch*: Switch
   nodePool*: MixNodePool
@@ -51,6 +63,11 @@ type MixProtocol* = ref object of LPProtocol
     ## reply never arrives; see surb_store.nim.
   destReadBehaviors: TableRef[string, DestReadBehavior]
   connPool: Table[PeerId, Connection]
+  dialsInFlight: Table[PeerId, Future[Connection]]
+    ## The dial in progress for a peer that has no pooled connection yet.
+    ## A second request for the same peer waits for it instead of dialing
+    ## again: two dials made two streams, the second overwrote the pooled
+    ## one, and the first stayed open until the closed-connection sweep.
   spamProtection: Opt[SpamProtection]
   delayStrategy: DelayStrategy
   coverTraffic*: Opt[CoverTraffic]
@@ -84,6 +101,9 @@ proc setLocalMultiAddr*(
 proc surbCredsLen*(mixProto: MixProtocol): int =
   mixProto.surbStore.len
 
+proc dialsInFlightLen*(mixProto: MixProtocol): int =
+  mixProto.dialsInFlight.len
+
 proc cryptoRandomInt(rng: Rng, max: int): Result[int, string] =
   if max == 0:
     return err("Max cannot be zero.")
@@ -105,22 +125,37 @@ proc removeClosedConnections(
     if mixProto.connPool.pop(p, conn):
       await conn.close()
 
-proc getConn(
+proc getConn*(
     mixProto: MixProtocol,
     pid: PeerId,
     addrs: seq[MultiAddress],
     codecs: seq[string],
     forceNewStream: bool = false,
 ): Future[Connection] {.async: (raises: [DialFailedError, CancelledError]).} =
+  ## The pooled connection to `pid`, or one dial for it. Requests that
+  ## arrive while that dial is in flight wait for it and share its result.
   if forceNewStream:
     # GC all expired connections including the one used for `pid`
     await mixProto.removeClosedConnections(pid)
+  let pooled = mixProto.connPool.getOrDefault(pid)
+  if not pooled.isNil():
+    return pooled
+  let inFlight = mixProto.dialsInFlight.getOrDefault(pid)
+  if not inFlight.isNil():
+    # `join` waits without cancelling the dial when this waiter is cancelled.
+    await inFlight.join()
+    let shared = mixProto.connPool.getOrDefault(pid)
+    if not shared.isNil():
+      return shared
+    # The dial failed for its own caller; this caller gets its own attempt.
+  let dial = mixProto.switch.dial(pid, addrs, codecs)
+  mixProto.dialsInFlight[pid] = dial
   try:
-    return mixProto.connPool[pid]
-  except KeyError:
-    let c = await mixProto.switch.dial(pid, addrs, codecs)
+    let c = await dial
     mixProto.connPool[pid] = c
     return c
+  finally:
+    mixProto.dialsInFlight.del(pid)
 
 proc writeLp(
     mixProto: MixProtocol,
@@ -267,6 +302,15 @@ method handleMixMessages*(
 
   when defined(enable_mix_benchmarks):
     let metadata = Metadata.deserialize(metadataBytes)
+
+  if mixProto.role == MixNodeRole.SenderOnly and processedSP.status != Reply:
+    # The packet names this node as a hop or as the exit node. A sender-only
+    # node serves nobody: the packet is dropped here, after the replay check
+    # took its tag, so a replay of it is dropped the same way.
+    debug "Sender-only node received a packet to process as a hop, dropping",
+      peerId = mixProto.mixNodeInfo.peerId, status = processedSP.status
+    mix_messages_error.inc(labelValues = [$processedSP.status, "SENDER_ONLY"])
+    return
 
   case processedSP.status
   of Exit:
@@ -1084,8 +1128,15 @@ proc init*(
     delayStrategy: Opt[DelayStrategy] = Opt.none(DelayStrategy),
     coverTraffic: Opt[CoverTraffic] = Opt.none(CoverTraffic),
     surbStore: SurbStore = nil,
+    role: MixNodeRole = MixNodeRole.Full,
 ) {.raises: [].} =
   ## Initialize a MixProtocol instance.
+  ##
+  ## `role` says what the node does with the packets it receives: `Full`
+  ## (the default) serves as an intermediary and an exit node; `SenderOnly`
+  ## drops such packets and processes its own replies only. A consumer that
+  ## advertises the mix key of a `Full` node and hides that of a `SenderOnly`
+  ## node keeps the two roles consistent.
   ##
   ## A nil `surbStore` gets a default one. Defaulting to nil rather than
   ## `SurbStore.new()` keeps the constructor out of the parameter list, so
@@ -1114,6 +1165,7 @@ proc init*(
     "SURB credential TTL must not exceed the replay tag TTL"
 
   mixProto.mixNodeInfo = mixNodeInfo
+  mixProto.role = role
   mixProto.switch = switch
   mixProto.rng = switch.rng
   mixProto.nodePool = MixNodePool.new(switch.peerStore)
