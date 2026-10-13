@@ -140,7 +140,7 @@ suite "Cover Traffic - Integration":
     check ct.slotPool.availableSlots == before
 
   asyncTest "MixProtocol wires SpamProtection epoch changes to cover traffic":
-    let nodeInfos = MixNodeInfo.generateRandomMany(5, rng())
+    let nodeInfos = testMixNodeInfos(5)
     let mixNodeInfo = nodeInfos[0]
     let switch =
       createSwitch(mixNodeInfo.multiAddr, Opt.some(mixNodeInfo.libp2pPrivKey))
@@ -151,6 +151,7 @@ suite "Cover Traffic - Integration":
     discard MixProtocol.new(
       mixNodeInfo,
       switch,
+      poolConfig = MixPoolConfig(addressPolicy: defaultAddressPolicy),
       spamProtection = Opt.some(SpamProtection(sp)),
       delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
       coverTraffic = Opt.some(CoverTraffic(ct)),

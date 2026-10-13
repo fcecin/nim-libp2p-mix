@@ -3,7 +3,7 @@
 
 {.used.}
 
-import results, sequtils
+import chronos, results, sequtils
 import libp2p/[crypto/crypto, crypto/secp, multiaddress, peerid, peerstore]
 import libp2p_mix/[mix_node, pool]
 import ./tools/unittest
@@ -18,8 +18,13 @@ suite "MixNodePool Tests":
 
   setup:
     peerStore = PeerStore.new()
-    pool = MixNodePool.new(peerStore)
-    mixNodes = MixNodeInfo.generateRandomMany(5, rng())
+    pool = MixNodePool.new(
+      peerStore, config = MixPoolConfig(addressPolicy: defaultAddressPolicy)
+    )
+    mixNodes = testMixNodeInfos(5)
+
+  teardown:
+    waitFor pool.stop()
 
   test "new creates empty pool":
     check pool.len == 0
@@ -88,15 +93,13 @@ suite "MixNodePool Tests":
 
     check pool.get(pubInfo.peerId).isNone
 
-  test "get returns none when key scheme is not Secp256k1":
+  test "get extracts the public key from the peer id":
     let pubInfo = mixNodes[0].toMixPubInfo()
 
     # Manually add with wrong key scheme
     peerStore[MixPubKeyBook][pubInfo.peerId] = pubInfo.mixPubKey
     peerStore[AddressBook][pubInfo.peerId] = @[pubInfo.multiAddr]
-    # KeyBook is not set, so scheme defaults to something other than Secp256k1
-
-    check pool.get(pubInfo.peerId).isNone
+    check pool.get(pubInfo.peerId).get().libp2pPubKey == pubInfo.libp2pPubKey
 
   test "get filters for supported addresses (IPv4 with TCP or QUIC-v1)":
     let pubInfo = mixNodes[0].toMixPubInfo()
@@ -231,3 +234,154 @@ suite "MixNodePool Tests":
       pool.add(pubInfo)
 
     check pool.len == 4
+
+suite "Mix pool ownership and policy":
+  asyncTest "public direct policy and encoded base both apply":
+    let store = PeerStore.new()
+    let pool = MixNodePool.new(store)
+    defer:
+      await pool.stop()
+    var info = testMixNodeInfos(1)[0].toMixPubInfo()
+    let peerId = info.peerId
+    for address in [
+      "/ip4/127.0.0.1/tcp/4000", "/ip4/10.0.0.1/tcp/4000", "/ip4/0.0.0.0/tcp/4000",
+      "/ip4/8.8.8.8/tcp/0", "/ip6/::1/tcp/4000", "/ip4/8.8.8.8/udp/4000",
+    ]:
+      check not pool.accepts(peerId, MultiAddress.init(address).tryGet())
+    check pool.accepts(peerId, MultiAddress.init("/ip4/8.8.8.8/tcp/4000").tryGet())
+    let relay = MultiAddress
+      .init("/ip4/8.8.8.8/tcp/4000/p2p/" & $peerId & "/p2p-circuit")
+      .tryGet()
+    check not pool.accepts(peerId, relay)
+    pool.config.addressPolicy = proc(ma: MultiAddress): bool {.gcsafe, raises: [].} =
+      ma == relay
+    check not pool.accepts(peerId, relay)
+    pool.config.addressPolicy = defaultAddressPolicy
+    check pool.accepts(peerId, relay)
+    check pool.accepts(peerId, info.multiAddr)
+    check not pool.accepts(peerId, MultiAddress.init("/ip4/0.0.0.0/tcp/4000").tryGet())
+
+  asyncTest "deletion in the peer store preserves configured and discovered nodes":
+    let store = PeerStore.new()
+    let pool = MixNodePool.new(
+      store, config = MixPoolConfig(addressPolicy: defaultAddressPolicy)
+    )
+    defer:
+      await pool.stop()
+    let infos = testMixNodeInfos(2)
+    pool.add(infos[0].toMixPubInfo())
+    pool.ingest(infos[1].toMixPubInfo())
+    store.del(infos[0].peerId)
+    store.del(infos[1].peerId)
+    check pool.len == 2
+    check pool.source(infos[0].peerId).get() == MixNodeSource.Configured
+    check pool.source(infos[1].peerId).get() == MixNodeSource.Discovered
+    pool.maintain(Moment.now() + 2.hours)
+    check pool.len == 1
+    check pool.contains(infos[0].peerId)
+    check not pool.contains(infos[1].peerId)
+
+  asyncTest "discovery cap excludes self and evicts an ineligible node first":
+    let infos = testMixNodeInfos(4)
+    let pool = MixNodePool.new(
+      PeerStore.new(),
+      infos[0].peerId,
+      MixPoolConfig(addressPolicy: defaultAddressPolicy, maxDiscovered: 2),
+    )
+    defer:
+      await pool.stop()
+    pool.add(infos[0].toMixPubInfo())
+    check pool.knownPeerIds().len == 0
+    pool.ingest(infos[1].toMixPubInfo())
+    var invalid = infos[2].toMixPubInfo()
+    invalid.multiAddr = MultiAddress.init("/ip6/::1/tcp/4000").tryGet()
+    pool.ingest(invalid)
+    pool.ingest(infos[3].toMixPubInfo())
+    check pool.knownPeerIds().len == 2
+    check pool.contains(infos[1].peerId)
+    check not pool.contains(infos[2].peerId)
+    check pool.contains(infos[3].peerId)
+
+  asyncTest "dial evidence applies exclusions and expires without a probe":
+    let store = PeerStore.new()
+    let pool = MixNodePool.new(
+      store, config = MixPoolConfig(addressPolicy: defaultAddressPolicy)
+    )
+    defer:
+      await pool.stop()
+    let infos = testMixNodeInfos(2)
+    let info = infos[0].toMixPubInfo()
+    pool.ingest(info)
+    pool.add(infos[1].toMixPubInfo())
+    let now = Moment.now()
+    pool.reportDial(info.peerId, @[info.multiAddr], MixDialOutcome.Failed, false, false)
+    check pool.len == 2
+    pool.reportDial(info.peerId, @[info.multiAddr], MixDialOutcome.Failed, true, true)
+    check pool.len == 2
+    pool.reportDial(
+      info.peerId,
+      @[info.multiAddr],
+      MixDialOutcome.Failed,
+      false,
+      true,
+      connectionLimit = true,
+    )
+    check pool.len == 2
+    pool.reportDial(
+      info.peerId, @[infos[1].multiAddr], MixDialOutcome.Failed, false, true
+    )
+    check pool.len == 2
+    let dialed = MultiAddress.init("/ip4/127.0.0.1/tcp/5000").tryGet()
+    store[LastSeenOutboundBook][info.peerId] = Opt.some(dialed)
+    check pool.get(info.peerId).get().multiAddr == dialed
+    pool.reportDial(
+      info.peerId, @[dialed], MixDialOutcome.Cancelled, false, true, now = now
+    )
+    check pool.get(info.peerId).isNone
+    pool.maintain(now + 30.minutes)
+    check pool.get(info.peerId).get().multiAddr == info.multiAddr
+    store[MixPubKeyBook][info.peerId] = info.mixPubKey
+    check pool.get(info.peerId).get().multiAddr == info.multiAddr
+    pool.reportDial(info.peerId, @[info.multiAddr], MixDialOutcome.Failed, false, true)
+    pool.reportDial(
+      info.peerId, @[info.multiAddr], MixDialOutcome.Succeeded, false, true
+    )
+    check pool.get(info.peerId).isSome
+    pool.reportDial(
+      infos[1].peerId, @[infos[1].multiAddr], MixDialOutcome.Failed, false, true
+    )
+    check pool.get(infos[1].peerId).isSome
+    check pool.counters.dialIgnored == 3
+    check pool.counters.dialFailed == 3
+    check pool.counters.dialSucceeded == 1
+
+  asyncTest "book handlers detach and attach once across restarts":
+    let store = PeerStore.new()
+    let pool = MixNodePool.new(
+      store, config = MixPoolConfig(addressPolicy: defaultAddressPolicy)
+    )
+    defer:
+      await pool.stop()
+    let info = testMixNodeInfos(1)[0].toMixPubInfo()
+    var events: seq[MixPoolEventKind]
+    let handler = pool.addChangeHandler(
+      proc(event: MixPoolEvent) =
+        events.add(event.kind)
+    )
+    store[AddressBook][info.peerId] = @[info.multiAddr]
+    store[MixPubKeyBook][info.peerId] = info.mixPubKey
+    check pool.len == 1
+    check MixPoolEventKind.Owned in events
+    await pool.stop()
+    events.setLen(0)
+    store[MixPubKeyBook][info.peerId] = info.mixPubKey
+    check events.len == 0
+    pool.start()
+    pool.start()
+    events.setLen(0)
+    store[MixPubKeyBook][info.peerId] = info.mixPubKey
+    check events == @[MixPoolEventKind.Updated]
+    pool.removeChangeHandler(handler)
+    events.setLen(0)
+    discard pool.remove(info.peerId)
+    check events.len == 0

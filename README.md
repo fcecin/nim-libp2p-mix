@@ -82,8 +82,7 @@ let mixNodeInfo = initMixNodeInfo(
   peerId, multiAddr, mixPubKey, mixPrivKey, libp2pPubKey, libp2pPrivKey
 )
 
-let mix = MixProtocol.new(mixNodeInfo, switch).valueOr:
-  return err("mix init failed: " & error)
+let mix = MixProtocol.new(mixNodeInfo, switch)
 
 # Optional: configure how the exit layer reads payloads for a given proto
 mix.registerDestReadBehavior("/your/proto/1.0.0", readLp(maxSize = -1))
@@ -102,8 +101,8 @@ await mix.start()
 # other libp2p connection.
 let conn = mix.toConnection(
   MixDestination.init(targetPeerId, targetMultiAddr),
-  proto = "/your/proto/1.0.0",
-  MixParameters(expectReply: Opt.some(true), numSurbs: Opt.some(1.byte)),
+  codec = "/your/proto/1.0.0",
+  params = MixParameters(expectReply: Opt.some(true), numSurbs: Opt.some(1.byte)),
 ).valueOr:
   return err(error)
 
@@ -114,6 +113,27 @@ let response = await conn.readLp(maxBytes)
 ```
 
 For a complete worked example, see [`examples/mix_ping.nim`](examples/mix_ping.nim).
+
+### Hop pool and reply paths
+
+`MixNodePool` retains its nodes independently of the switch peer store. `add` registers a configured node for the life of the pool. `ingest` registers a discovered node. A discovered node expires after one hour without a fresh mix record, successful dial or live connection.
+
+The default `publicDirectAddressPolicy` accepts public, direct, mix-encodable hop addresses. A local simulation or private network supplies an explicit policy.
+
+```nim
+let mix = MixProtocol.new(
+  mixNodeInfo, switch,
+  poolConfig = MixPoolConfig(addressPolicy: defaultAddressPolicy),
+)
+```
+
+Each reply path ends on a pool member with a live connection to the sender. A request that expects a reply prepares that connection before transmission. Preparation dials at most two candidates and waits at most five seconds. `replyHopTimeout` controls this wait. Fire-and-forget sends do not prepare a reply path.
+
+A failed hop-address dial removes a discovered node from paths for thirty minutes. The pool restores the node without a probe. Configured nodes remain on paths. A missing reply, existing-connection failure, local connection limit or isolated sender does not trigger this backoff.
+
+`MixPoolConfig` controls discovery lifetime, failure backoff, maintenance interval and the discovery limit. `knownPeerIds` includes retained nodes. `peerIds`, `get` and `len` expose eligible nodes. Pool events let applications retain service metadata until `Removed`. Applications can inspect dial counters or report external dial evidence through `reportDial`.
+
+`MixProtocol.start` and `stop` manage maintenance, peer-store observers and pending dials. A connection close cancels its pending write. An application timeout must allow both reply preparation and the subsequent exchange.
 
 ### Pluggable spam protection
 

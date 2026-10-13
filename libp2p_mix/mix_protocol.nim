@@ -11,7 +11,7 @@ import
   ]
 import libp2p/protocols/protocol
 import libp2p/stream/[connection, lpstream]
-import libp2p/[switch, multicodec, peerinfo, varint]
+import libp2p/[switch, multicodec, peerinfo, varint, connmanager]
 import libp2p/crypto/crypto
 
 export pool
@@ -39,6 +39,11 @@ func isCoverTraffic*(msg: MixMessage): bool =
 ## network composed of participating libp2p nodes, known as mix nodes. Each message is
 ## routed independently in a stateless manner, allowing other libp2p protocols to selectively
 ## anonymize messages without modifying their core protocol behavior.
+type HopDial = ref object
+  future: Future[bool].Raising([CancelledError])
+  users: int
+  keepAlive: bool
+
 type MixProtocol* = ref object of LPProtocol
   mixNodeInfo: MixNodeInfo
   switch*: Switch
@@ -51,6 +56,11 @@ type MixProtocol* = ref object of LPProtocol
     ## reply never arrives; see surb_store.nim.
   destReadBehaviors: TableRef[string, DestReadBehavior]
   connPool: Table[PeerId, Connection]
+  hopDials: Table[PeerId, HopDial]
+  streamDials: seq[Future[Connection].Raising([DialFailedError, CancelledError])]
+  stopping: bool
+  replyHopTimeout*: Duration = 5.seconds
+  replyHopFailures*: uint64
   spamProtection: Opt[SpamProtection]
   delayStrategy: DelayStrategy
   coverTraffic*: Opt[CoverTraffic]
@@ -84,12 +94,6 @@ proc setLocalMultiAddr*(
 proc surbCredsLen*(mixProto: MixProtocol): int =
   mixProto.surbStore.len
 
-proc cryptoRandomInt(rng: Rng, max: int): Result[int, string] =
-  if max == 0:
-    return err("Max cannot be zero.")
-  let res = rng.generate(uint64) mod uint64(max)
-  ok(res.int)
-
 proc removeClosedConnections(
     mixProto: MixProtocol, pid: PeerId
 ) {.async: (raises: []).} =
@@ -105,6 +109,72 @@ proc removeClosedConnections(
     if mixProto.connPool.pop(p, conn):
       await conn.close()
 
+proc connectionLimitReached(error: ref DialFailedError): bool =
+  var cause = error.parent
+  while not cause.isNil:
+    if cause of TooManyConnectionsError:
+      return true
+    cause = cause.parent
+
+proc reportDial(
+    mixProto: MixProtocol,
+    pid: PeerId,
+    addrs: seq[MultiAddress],
+    outcome: MixDialOutcome,
+    hadConnection: bool,
+    connectionLimit = false,
+) =
+  if not mixProto.stopping:
+    mixProto.nodePool.reportDial(
+      pid,
+      addrs,
+      outcome,
+      hadConnection,
+      mixProto.switch.connectedPeers().anyIt(it != pid),
+      connectionLimit,
+    )
+
+proc connectHop(
+    mixProto: MixProtocol, pid: PeerId, addrs: seq[MultiAddress]
+): Future[bool] {.async: (raises: [CancelledError]).} =
+  let hadConnection = mixProto.switch.isConnected(pid)
+  try:
+    await mixProto.switch.connect(pid, addrs).wait(mixProto.replyHopTimeout)
+    mixProto.reportDial(pid, addrs, MixDialOutcome.Succeeded, hadConnection)
+    return true
+  except AsyncTimeoutError:
+    mixProto.reportDial(pid, addrs, MixDialOutcome.Failed, hadConnection)
+  except DialFailedError as exc:
+    mixProto.reportDial(
+      pid, addrs, MixDialOutcome.Failed, hadConnection, exc.connectionLimitReached()
+    )
+  except CancelledError as exc:
+    mixProto.reportDial(pid, addrs, MixDialOutcome.Cancelled, hadConnection)
+    raise exc
+  return false
+
+proc acquireDial(
+    mixProto: MixProtocol, pid: PeerId, addrs: seq[MultiAddress], keepAlive = false
+): HopDial =
+  mixProto.hopDials.withValue(pid, current):
+    if not current.future.finished:
+      current.keepAlive = current.keepAlive or keepAlive
+      return current[]
+  for peerId in mixProto.hopDials.keys.toSeq():
+    if mixProto.hopDials.getOrDefault(peerId).future.finished:
+      mixProto.hopDials.del(peerId)
+  result = HopDial(keepAlive: keepAlive)
+  result.future = mixProto.connectHop(pid, addrs)
+  mixProto.hopDials[pid] = result
+
+proc pendingDials*(mixProto: MixProtocol): int =
+  for dial in mixProto.hopDials.values:
+    if not dial.future.finished:
+      result.inc()
+  for dial in mixProto.streamDials:
+    if not dial.finished:
+      result.inc()
+
 proc getConn(
     mixProto: MixProtocol,
     pid: PeerId,
@@ -112,15 +182,45 @@ proc getConn(
     codecs: seq[string],
     forceNewStream: bool = false,
 ): Future[Connection] {.async: (raises: [DialFailedError, CancelledError]).} =
+  if mixProto.stopping:
+    raise newException(DialFailedError, "mix is stopping")
   if forceNewStream:
-    # GC all expired connections including the one used for `pid`
     await mixProto.removeClosedConnections(pid)
+  mixProto.connPool.withValue(pid, connection):
+    if not connection[].closed and not connection[].atEof:
+      return connection[]
+  if not mixProto.switch.isConnected(pid):
+    let dial = mixProto.acquireDial(pid, addrs)
+    dial.users.inc()
+    try:
+      # A waiter can cancel without cancelling another send's dial.
+      discard await race(FutureBase(dial.future))
+      if not await dial.future:
+        raise newException(DialFailedError, "mix hop connection failed")
+    finally:
+      dial.users.dec()
+      if dial.users == 0 and not dial.keepAlive and not dial.future.finished:
+        await dial.future.cancelAndWait()
+  if mixProto.stopping:
+    raise newException(DialFailedError, "mix is stopping")
+  let hadConnection = mixProto.switch.isConnected(pid)
+  let pending = mixProto.switch.dial(pid, addrs, codecs)
+  mixProto.streamDials.add(pending)
   try:
-    return mixProto.connPool[pid]
-  except KeyError:
-    let c = await mixProto.switch.dial(pid, addrs, codecs)
-    mixProto.connPool[pid] = c
-    return c
+    let connection = await pending
+    mixProto.reportDial(pid, addrs, MixDialOutcome.Succeeded, hadConnection)
+    mixProto.connPool[pid] = connection
+    return connection
+  except DialFailedError as exc:
+    mixProto.reportDial(
+      pid, addrs, MixDialOutcome.Failed, hadConnection, exc.connectionLimitReached()
+    )
+    raise exc
+  except CancelledError as exc:
+    mixProto.reportDial(pid, addrs, MixDialOutcome.Cancelled, hadConnection)
+    raise exc
+  finally:
+    mixProto.streamDials.keepItIf(not it.finished)
 
 proc writeLp(
     mixProto: MixProtocol,
@@ -522,57 +622,88 @@ proc getMaxMessageSizeForCodec*(
     return err("cannot encode messages for this codec")
   return ok(DataSize - totalLen)
 
+const NoReplyHopError* = "no eligible mix peer has a connection for the reply"
+
+proc replyCandidates(
+    mixProto: MixProtocol, destPeerId, exitPeerId: PeerId
+): seq[PeerId] =
+  mixProto.nodePool.peerIds().filterIt(
+    it != destPeerId and it != exitPeerId and it != mixProto.mixNodeInfo.peerId
+  )
+
+proc prepareReplyPath*(
+    mixProto: MixProtocol, destPeerId, exitPeerId: PeerId
+): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+  if mixProto.stopping:
+    return err("mix is stopping")
+  let candidates = mixProto.replyCandidates(destPeerId, exitPeerId)
+  if candidates.len < PathLength - 1:
+    return err("not enough mix peers for a reply path")
+  if candidates.anyIt(mixProto.switch.isConnected(it)):
+    return ok()
+  let chosen = mixProto.rng.pick(candidates, min(2, candidates.len)).valueOr:
+    return err(NoReplyHopError)
+  var pending: seq[Future[bool].Raising([CancelledError])]
+  for peerId in chosen:
+    let addresses = mixProto.nodePool.hopAddresses(peerId)
+    pending.add(mixProto.acquireDial(peerId, addresses, keepAlive = true).future)
+  let deadline = sleepAsync(mixProto.replyHopTimeout)
+  try:
+    while pending.len > 0 and not deadline.finished:
+      try:
+        discard await race(pending.mapIt(FutureBase(it)) & @[FutureBase(deadline)])
+      except ValueError:
+        break
+      if mixProto.stopping:
+        return err("mix is stopping")
+      if mixProto.replyCandidates(destPeerId, exitPeerId).anyIt(
+        mixProto.switch.isConnected(it)
+      ):
+        return ok()
+      pending.keepItIf(not it.finished)
+  finally:
+    await deadline.cancelAndWait()
+  mixProto.replyHopFailures.inc()
+  return err(NoReplyHopError)
+
+proc replyPath*(
+    mixProto: MixProtocol, destPeerId, exitPeerId: PeerId
+): Result[seq[MixPubInfo], string] {.raises: [].} =
+  let candidates = mixProto.replyCandidates(destPeerId, exitPeerId)
+  if candidates.len < PathLength - 1:
+    return err("not enough mix peers for a reply path")
+  let last = mixProto.rng.pickOne(candidates.filterIt(mixProto.switch.isConnected(it))).valueOr:
+    return err(NoReplyHopError)
+  let preceding = mixProto.rng.pick(candidates.filterIt(it != last), PathLength - 2).valueOr:
+    return err("not enough mix peers for a reply path")
+  var path: seq[MixPubInfo]
+  for peerId in preceding & @[last]:
+    let info = mixProto.nodePool.get(peerId).valueOr:
+      return err("reply hop left the pool")
+    path.add(info)
+  path.add(mixProto.localMixPubInfo())
+  ok(path)
+
 method buildSurb*(
     mixProto: MixProtocol, id: SURBIdentifier, destPeerId: PeerId, exitPeerId: PeerId
 ): Result[SURB, string] {.base, gcsafe, raises: [].} =
+  let path = ?mixProto.replyPath(destPeerId, exitPeerId)
   var
-    publicKeys: seq[FieldElement] = @[]
-    hops: seq[Hop] = @[]
-    delays: seq[Delay] = @[]
-
-  if mixProto.nodePool.len < PathLength:
-    return err("No. of public mix nodes less than path length")
-
-  # Remove exit and dest node from nodes to consider for surbs
-  var poolPeerIds =
-    mixProto.nodePool.peerIds().filterIt(it != exitPeerId and it != destPeerId)
-  var availableIndices = toSeq(0 ..< poolPeerIds.len)
-
-  # Select L mix nodes at random
-  for i in 0 ..< PathLength:
-    let (peerId, multiAddr, mixPubKey, hopDelay) =
-      if i < PathLength - 1:
-        let randomIndexPosition = cryptoRandomInt(mixProto.rng, availableIndices.len).valueOr:
-          return err("failed to generate random num: " & error)
-        let selectedIndex = availableIndices[randomIndexPosition]
-        let randPeerId = poolPeerIds[selectedIndex]
-        availableIndices.del(randomIndexPosition)
-        debug "Selected mix node for surbs: ", indexInPath = i, peerId = randPeerId
-        let mixPubInfo = mixProto.nodePool.get(randPeerId).valueOr:
-          return err("could not get mix pub info for peer: " & $randPeerId)
-        (
-          mixPubInfo.peerId,
-          mixPubInfo.multiAddr,
-          mixPubInfo.mixPubKey,
-          mixProto.delayStrategy.generateForEntry(),
-        )
+    publicKeys: seq[FieldElement]
+    hops: seq[Hop]
+    delays: seq[Delay]
+  for i, node in path:
+    let encoded = multiAddrToBytes(node.peerId, node.multiAddr).valueOr:
+      return err("failed to encode reply hop: " & error)
+    publicKeys.add(node.mixPubKey)
+    hops.add(Hop.init(encoded))
+    delays.add(
+      if i < path.len - 1:
+        mixProto.delayStrategy.generateForEntry()
       else:
-        (
-          mixProto.mixNodeInfo.peerId, mixProto.mixNodeInfo.multiAddr,
-          mixProto.mixNodeInfo.mixPubKey, NoDelay,
-        ) # No delay for last hop
-
-    publicKeys.add(mixPubKey)
-
-    let multiAddrBytes = multiAddrToBytes(peerId, multiAddr).valueOr:
-      mix_messages_error.inc(labelValues = ["Entry/SURB", "INVALID_MIX_INFO"])
-      return err("failed to convert multiaddress to bytes: " & error)
-
-    hops.add(Hop.init(multiAddrBytes))
-
-    delays.add(hopDelay)
-
-  return createSURB(publicKeys, delays, hops, id, mixProto.rng)
+        NoDelay
+    )
+  createSURB(publicKeys, delays, hops, id, mixProto.rng)
 
 proc buildSurbs(
     mixProto: MixProtocol,
@@ -795,84 +926,45 @@ proc anonymizeLocalProtocolSend*(
     delays: seq[Delay] = @[]
     exitPeerId: PeerId
 
-  let numMixNodes = mixProto.nodePool.len
-  var numAvailableNodes = numMixNodes
+  if mixProto.stopping:
+    return err("mix is stopping")
+  let possibleExits = mixProto.nodePool.peerIds().filterIt(it != destination.peerId)
+  if destination.kind == MixNode:
+    if mixProto.nodePool.get(destination.peerId).isNone:
+      return err("Destination does not support mix")
+    exitPeerId = destination.peerId
+  else:
+    exitPeerId = mixProto.rng.pickOne(possibleExits).valueOr:
+      return err("not enough mix peers for a forward path")
 
-  debug "Destination data", destination
+  if numSurbs > 0:
+    (await mixProto.prepareReplyPath(destination.peerId, exitPeerId)).isOkOr:
+      return err(error)
 
-  if mixProto.nodePool.get(destination.peerId).isSome:
-    numAvailableNodes = numMixNodes - 1
-
-  if numAvailableNodes < PathLength:
-    mix_messages_error.inc(labelValues = ["Entry", "LOW_MIX_POOL"])
-    return err(
-      fmt"No. of public mix nodes ({numAvailableNodes}) less than path length ({PathLength})."
-    )
-
-  var poolPeerIds = mixProto.nodePool.peerIds()
-  var availableIndices = toSeq(0 ..< poolPeerIds.len)
-
-  let index = poolPeerIds.find(destination.peerId)
-  if index != -1:
-    availableIndices.del(index)
-  elif destination.kind == MixNode:
-    return err("Destination does not support mix")
-
+  let candidates =
+    mixProto.nodePool.peerIds().filterIt(it != destination.peerId and it != exitPeerId)
+  if candidates.len < PathLength - 1:
+    return err("not enough mix peers for a forward path")
+  let preceding = mixProto.rng.pick(candidates, PathLength - 1).valueOr:
+    return err("not enough mix peers for a forward path")
   var nextHopAddr: MultiAddress
   var nextHopPeerId: PeerId
-  while hop.len < PathLength:
-    if availableIndices.len == 0:
-      mix_messages_error.inc(labelValues = ["Entry", "LOW_MIX_POOL"])
-      return err("Ran out of available mix nodes while constructing path")
-
-    let randomIndexPosition = cryptoRandomInt(mixProto.rng, availableIndices.len).valueOr:
-      mix_messages_error.inc(labelValues = ["Entry", "NON_RECOVERABLE"])
-      return err(fmt"Failed to generate random number: {error}")
-    let selectedIndex = availableIndices[randomIndexPosition]
-    var randPeerId = poolPeerIds[selectedIndex]
-    availableIndices.del(randomIndexPosition)
-
-    if destination.kind == ForwardAddr and randPeerId == destination.peerId:
-      continue
-
-    if hop.len == PathLength - 1:
-      case destination.kind
-      of ForwardAddr:
-        exitPeerId = randPeerId
-      of MixNode:
-        exitPeerId = destination.peerId
-        randPeerId = destination.peerId
-
-    debug "Selected mix node: ", indexInPath = hop.len, peerId = randPeerId
-
-    let mixPubInfo = mixProto.nodePool.get(randPeerId).valueOr:
-      mix_messages_error.inc(labelValues = ["Entry", "INVALID_MIX_INFO"])
-      trace "Failed to get mix pub info for peer, skipping and removing node from pool",
-        peerId = randPeerId
-      discard mixProto.nodePool.remove(randPeerId)
-      continue
-    let (peerId, multiAddr, mixPubKey, _) = mixPubInfo.get()
-
-    let multiAddrBytes = multiAddrToBytes(peerId, multiAddr).valueOr:
-      mix_messages_error.inc(labelValues = ["Entry", "INVALID_MIX_INFO"])
-      trace "Failed to convert multiaddress to bytes, skipping and removing node from pool",
-        error = error, peerId = peerId, multiAddr = multiAddr
-      discard mixProto.nodePool.remove(randPeerId)
-      continue
-
-    publicKeys.add(mixPubKey)
-
+  for randPeerId in preceding & @[exitPeerId]:
+    let info = mixProto.nodePool.get(randPeerId).valueOr:
+      return err("forward hop left the pool")
+    let encoded = multiAddrToBytes(info.peerId, info.multiAddr).valueOr:
+      return err("failed to encode forward hop: " & error)
+    publicKeys.add(info.mixPubKey)
     if hop.len == 0:
-      nextHopAddr = multiAddr
-      nextHopPeerId = peerId
-
+      nextHopAddr = info.multiAddr
+      nextHopPeerId = info.peerId
     delays.add(
-      if hop.len != PathLength - 1:
+      if hop.len < PathLength - 1:
         mixProto.delayStrategy.generateForEntry()
       else:
         NoDelay
     )
-    hop.add(Hop.init(multiAddrBytes))
+    hop.add(Hop.init(encoded))
 
   # Encode destination
   let destHop =
@@ -890,6 +982,10 @@ proc anonymizeLocalProtocolSend*(
     return err(fmt"Could not prepend SURBs: {error}")
 
   let session = prepared.session
+  var sent = false
+  defer:
+    if not sent:
+      session.get(nil).release()
 
   # Past this point the reply credentials are registered, so every failure
   # must release them: the packet never left this process, so no reply can
@@ -925,6 +1021,7 @@ proc anonymizeLocalProtocolSend*(
   (await mixProto.sendPacket(nextHopPeerId, nextHopAddr, sphinxPacket, logConfig)).isOkOr:
     releaseAndFail(error)
 
+  sent = true
   return ok(session)
 
 proc sendSurbReply*(
@@ -1095,6 +1192,10 @@ proc sendCoverPacket*(
 
 method start*(mixProto: MixProtocol) {.async: (raises: [CancelledError]).} =
   await procCall LPProtocol(mixProto).start()
+  mixProto.stopping = false
+  mixProto.nodePool.start()
+  mixProto.tagManager.start()
+  mixProto.surbStore.start()
   mixProto.coverTraffic.withValue(ct):
     await ct.start()
 
@@ -1102,6 +1203,19 @@ method stop*(mixProto: MixProtocol) {.async: (raises: []).} =
   ## Stop the MixProtocol background tasks and cancel all in-flight
   ## handleMixMessages futures.
   mixProto.started = false
+  mixProto.stopping = true
+  await mixProto.nodePool.stop()
+  let dials = mixProto.hopDials.values.toSeq()
+  for dial in dials:
+    dial.future.cancelSoon()
+  await noCancel allFutures(dials.mapIt(it.future.cancelAndWait()))
+  mixProto.hopDials.clear()
+  let streams = mixProto.streamDials
+  await noCancel allFutures(streams.mapIt(it.cancelAndWait()))
+  mixProto.streamDials = @[]
+  let connections = mixProto.connPool.values.toSeq()
+  mixProto.connPool.clear()
+  await noCancel allFutures(connections.mapIt(it.close()))
 
   await mixProto.tagManager.stop()
 
@@ -1126,6 +1240,7 @@ proc init*(
     delayStrategy: Opt[DelayStrategy] = Opt.none(DelayStrategy),
     coverTraffic: Opt[CoverTraffic] = Opt.none(CoverTraffic),
     surbStore: SurbStore = nil,
+    poolConfig: MixPoolConfig = MixPoolConfig(),
 ) {.raises: [].} =
   ## Initialize a MixProtocol instance.
   ##
@@ -1158,7 +1273,13 @@ proc init*(
   mixProto.mixNodeInfo = mixNodeInfo
   mixProto.switch = switch
   mixProto.rng = switch.rng
-  mixProto.nodePool = MixNodePool.new(switch.peerStore)
+  mixProto.nodePool = MixNodePool.new(
+    switch.peerStore,
+    mixNodeInfo.peerId,
+    poolConfig,
+    proc(peerId: PeerId): bool =
+      switch.isConnected(peerId),
+  )
   mixProto.tagManager = tagManager
   mixProto.surbStore = store
   mixProto.destReadBehaviors = newTable[string, DestReadBehavior]()
@@ -1242,6 +1363,7 @@ proc new*(
     delayStrategy: Opt[DelayStrategy] = Opt.none(DelayStrategy),
     coverTraffic: Opt[CoverTraffic] = Opt.none(CoverTraffic),
     surbStore: SurbStore = nil,
+    poolConfig: MixPoolConfig = MixPoolConfig(),
 ): T {.raises: [].} =
   ## Create a new MixProtocol instance.
   ##
@@ -1254,6 +1376,6 @@ proc new*(
   let mixProto = new(T)
   mixProto.init(
     mixNodeInfo, switch, tagManager, spamProtection, delayStrategy, coverTraffic,
-    surbStore,
+    surbStore, poolConfig,
   )
   mixProto
