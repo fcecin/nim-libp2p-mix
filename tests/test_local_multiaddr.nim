@@ -23,7 +23,7 @@ proc setupNodesWithInfos(
     count: int
 ): Future[tuple[nodes: seq[MixProtocol], infos: seq[MixNodeInfo]]] {.async.} =
   ## Like setupMixNodes, but also returns MixNodeInfo so tests can peel Sphinx hops.
-  let infos = MixNodeInfo.generateRandomMany(count, rng())
+  let infos = testMixNodeInfos(count, ephemeral = true)
   var nodes: seq[MixProtocol] = @[]
   for info in infos:
     let switch = createSwitch(info.multiAddr, Opt.some(info.libp2pPrivKey))
@@ -31,6 +31,7 @@ proc setupNodesWithInfos(
     let proto = MixProtocol.new(
       info,
       switch,
+      poolConfig = MixPoolConfig(addressPolicy: defaultAddressPolicy),
       delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
     )
     proto.nodePool.add(infos.includeAllExcept(info))
@@ -90,8 +91,15 @@ suite "setLocalMultiAddr":
     let destInfo = infos[1]
     let exitInfo = infos[2]
     replacePool(
-      mix, @[infos[3].toMixPubInfo(), infos[4].toMixPubInfo(), exitInfo.toMixPubInfo()]
+      mix,
+      @[
+        nodes[3].localMixPubInfo(),
+        nodes[4].localMixPubInfo(),
+        nodes[2].localMixPubInfo(),
+      ],
     )
+
+    await mix.switch.connect(infos[3].peerId, @[nodes[3].localMixPubInfo().multiAddr])
 
     var id: SURBIdentifier
     rng().generate(id)
@@ -132,7 +140,7 @@ suite "setLocalMultiAddr":
     check mix.setLocalMultiAddr(updated).isOk
 
     # Force intermediates onto a known PathLength-1 subset.
-    replacePool(mix, infos[1 .. PathLength - 1].mapIt(it.toMixPubInfo()))
+    replacePool(mix, nodes[1 .. PathLength - 1].mapIt(it.localMixPubInfo()))
 
     let built = (await mix.buildCoverPacket()).expect("build cover packet")
     let selfMa = selfMultiAddrFromPath(built.packet, built.firstHopPeerId, infos)

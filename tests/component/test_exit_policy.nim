@@ -82,7 +82,12 @@ proc defaultExitDelivery() {.async.} =
         Opt.some(CoverTraffic(cover))
       else:
         Opt.none(CoverTraffic)
-    let proto = MixProtocol.new(infos[i], sw, coverTraffic = ct)
+    let proto = MixProtocol.new(
+      infos[i],
+      sw,
+      coverTraffic = ct,
+      poolConfig = MixPoolConfig(addressPolicy: defaultAddressPolicy),
+    )
     sw.mount(proto)
     if i == 4:
       sw.mount(receiver(local))

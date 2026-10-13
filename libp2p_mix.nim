@@ -39,6 +39,9 @@ export SpamProtectionDelayStrategy
 
 export mix_node
 
+export pool
+export prepareReplyPath, replyPath, pendingDials
+
 export MixNodePool
 export add
 export remove

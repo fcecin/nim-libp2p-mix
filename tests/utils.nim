@@ -15,6 +15,13 @@ import libp2p_mix/delay_strategy
 import ./tools/[unittest, crypto]
 import ./[mock_mix, spam_protection_impl]
 
+proc testMixNodeInfos*(count: int, ephemeral = false): seq[MixNodeInfo] =
+  result = MixNodeInfo.generateRandomMany(count, rng())
+  for i, info in result.mpairs:
+    info.multiAddr = MultiAddress
+      .init("/ip4/127.0.0.1/tcp/" & $(if ephemeral: 0 else: 4242 + i))
+      .tryGet()
+
 proc createSwitch*(
     multiAddr: MultiAddress = MultiAddress.init("/ip4/0.0.0.0/tcp/0").tryGet(),
     libp2pPrivKey: Opt[SkPrivateKey] = Opt.none(SkPrivateKey),
@@ -55,6 +62,7 @@ proc setupMixNode[T: MixProtocol](
   let proto = T.new(
     mixNodeInfo,
     switch,
+    poolConfig = MixPoolConfig(addressPolicy: defaultAddressPolicy),
     spamProtection = spamProtection,
     delayStrategy = Opt.some(actualDelayStrategy),
   )
@@ -73,7 +81,7 @@ proc setupMixNodes*(
     delayStrategy = Opt.none(DelayStrategy),
 ): Future[seq[MixProtocol]] {.async.} =
   var nodes: seq[MixProtocol] = @[]
-  let nodeInfos = MixNodeInfo.generateRandomMany(numNodes, rng())
+  let nodeInfos = testMixNodeInfos(numNodes, ephemeral = true)
   for mixNodeInfo in nodeInfos:
     let switch =
       createSwitch(mixNodeInfo.multiAddr, Opt.some(mixNodeInfo.libp2pPrivKey))
@@ -92,7 +100,7 @@ proc setupMixNodesWithMock*(
   ## Like setupMixNodes, but the first node is a MockMixProtocol.
   var nodes: seq[MixProtocol] = @[]
 
-  let nodeInfos = MixNodeInfo.generateRandomMany(numNodes, rng())
+  let nodeInfos = testMixNodeInfos(numNodes, ephemeral = true)
 
   let mockMixNodeInfo = nodeInfos[0]
   let mockSwitch =

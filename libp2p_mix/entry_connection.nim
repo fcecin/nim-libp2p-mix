@@ -38,6 +38,7 @@ type MixEntryConnection* = ref object of Connection
   cached: seq[byte]
   replyTimeout: Duration
   sent: bool
+  sending: Future[void].Raising([CancelledError, LPStreamError])
   replySession: Opt[SurbSession]
 
 func shortLog*(conn: MixEntryConnection): string =
@@ -117,20 +118,28 @@ method write*(
   if msg.len() > DataSize:
     raise newException(LPStreamError, "exceeds max msg size of " & $DataSize & " bytes")
 
-  if not self.replyReceivedFut.isNil and self.sent:
+  if not self.replyReceivedFut.isNil and (self.sent or not self.sending.isNil):
     raise newException(
       LPStreamError,
       "mix connection expecting a reply supports a single write; " &
         "use one connection per request",
     )
 
-  await self.mixDialer(move(msg), self.codec, self.destination)
-  self.sent = true
+  let pending = self.mixDialer(move(msg), self.codec, self.destination)
+  self.sending = pending
+  try:
+    await pending
+    self.sent = true
+  finally:
+    if self.sending == pending:
+      self.sending = nil
 
 proc shortLog*(self: MixEntryConnection): string {.raises: [].} =
   "[MixEntryConnection] Destination: " & $self.destination
 
 method closeImpl*(self: MixEntryConnection): Future[void] {.async: (raises: []).} =
+  if not self.sending.isNil:
+    await self.sending.cancelAndWait()
   self.releaseReplyCreds()
   if not self.incomingFut.isNil:
     self.incomingFut.cancelSoon()

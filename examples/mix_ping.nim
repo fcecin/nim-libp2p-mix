@@ -47,7 +47,9 @@ proc mixPingSimulation() {.async: (raises: [Exception]).} =
   # Set up mix protocols on each mix node
   for nodeInfo in mixNodeInfos:
     var switch = createSwitch(nodeInfo.multiAddr, rng, Opt.some(nodeInfo.libp2pPrivKey))
-    let proto = MixProtocol.new(nodeInfo, switch)
+    let proto = MixProtocol.new(
+      nodeInfo, switch, poolConfig = MixPoolConfig(addressPolicy: defaultAddressPolicy)
+    )
 
     # Populate nodePool with all other nodes' public info
     proto.nodePool.add(mixNodeInfos.includeAllExcept(nodeInfo))
@@ -73,6 +75,13 @@ proc mixPingSimulation() {.async: (raises: [Exception]).} =
   # Start all switches
   await switches.mapIt(it.start()).allFutures()
   await destNode.start()
+
+  for proto in mixProtos:
+    proto.setLocalMultiAddr(proto.switch.peerInfo.addrs[0]).expect("bound address")
+  for proto in mixProtos:
+    for other in mixProtos:
+      if proto != other:
+        proto.nodePool.add(other.localMixPubInfo())
 
   # Pick sender (first mix node) and send ping through the mix network
   let senderIndex = 0

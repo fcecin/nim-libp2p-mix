@@ -60,7 +60,7 @@ method verifyProofAsync(
 
 suite "Asynchronous proof provider":
   asyncTest "cover proofs overlap hold and epoch-crossed packets are discarded":
-    let infos = MixNodeInfo.generateRandomMany(3, rng())
+    let infos = testMixNodeInfos(3)
     let sw = createSwitch(infos[0].multiAddr, Opt.some(infos[0].libp2pPrivKey))
     let provider = AsyncProofs(proofSize: 1, proofGate: newAsyncEvent())
     let ct = ConstantRateCoverTraffic.new(
@@ -72,6 +72,7 @@ suite "Asynchronous proof provider":
     let node = MixProtocol.new(
       infos[0],
       sw,
+      poolConfig = MixPoolConfig(addressPolicy: defaultAddressPolicy),
       spamProtection = Opt.some(SpamProtection(provider)),
       delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
       coverTraffic = Opt.some(CoverTraffic(ct)),
@@ -135,7 +136,7 @@ suite "Asynchronous proof provider":
     check not provider.pending
 
   asyncTest "cover proof completed within the epoch is sent":
-    let infos = MixNodeInfo.generateRandomMany(3, rng())
+    let infos = testMixNodeInfos(3)
     let sw = createSwitch(infos[0].multiAddr, Opt.some(infos[0].libp2pPrivKey))
     let provider = AsyncProofs(proofSize: 1)
     let ct = ConstantRateCoverTraffic.new(
@@ -147,6 +148,7 @@ suite "Asynchronous proof provider":
     let node = MixProtocol.new(
       infos[0],
       sw,
+      poolConfig = MixPoolConfig(addressPolicy: defaultAddressPolicy),
       spamProtection = Opt.some(SpamProtection(provider)),
       delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
       coverTraffic = Opt.some(CoverTraffic(ct)),
@@ -173,7 +175,7 @@ suite "Asynchronous proof provider":
     check proof == @[packet[0]]
 
   asyncTest "cover precomputation spends no proofs; routing awaits per-hop proofs":
-    let infos = MixNodeInfo.generateRandomMany(5, rng())
+    let infos = testMixNodeInfos(5, ephemeral = true)
     var nodes: seq[MixProtocol]
     var providers: seq[AsyncProofs]
     for info in infos:
@@ -182,6 +184,7 @@ suite "Asynchronous proof provider":
       let node = MixProtocol.new(
         info,
         sw,
+        poolConfig = MixPoolConfig(addressPolicy: defaultAddressPolicy),
         spamProtection = Opt.some(SpamProtection(provider)),
         delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
       )
