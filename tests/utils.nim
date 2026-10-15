@@ -276,20 +276,30 @@ proc stop*(server: UnresponsiveServer) {.async: (raises: []).} =
     discard
   await server.server.closeWait()
 
-proc ephemeralMixNodes*(count: int): Future[seq[MixProtocol]] {.async.} =
+proc ephemeralMixNodes*(
+    count: int,
+    create: proc(index: int, info: MixNodeInfo, sw: Switch): MixProtocol {.
+      gcsafe, raises: []
+    .} = nil,
+): Future[seq[MixProtocol]] {.async.} =
   ## Builds and starts `count` mix nodes on loopback. Each node listens on a
-  ## port that the OS assigns, uses `NoSamplingDelayStrategy`, and has every
-  ## other node in its pool.
+  ## port that the OS assigns and has every other node in its pool. `create`
+  ## builds each node from its index, its info and its switch. When `create`
+  ## is nil, each node is a `MixProtocol` with no sampling delay.
   var nodes: seq[MixProtocol]
-  for _ in 0 ..< count:
+  for i in 0 ..< count:
     var info = MixNodeInfo.generateRandom(0, rng())
     info.multiAddr = MultiAddress.init("/ip4/127.0.0.1/tcp/0").tryGet()
     let sw = createSwitch(info.multiAddr, Opt.some(info.libp2pPrivKey))
-    let node = MixProtocol.new(
-      info,
-      sw,
-      delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
-    )
+    let node =
+      if create.isNil:
+        MixProtocol.new(
+          info,
+          sw,
+          delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
+        )
+      else:
+        create(i, info, sw)
     sw.mount(node)
     nodes.add(node)
   await startNodes(nodes)
