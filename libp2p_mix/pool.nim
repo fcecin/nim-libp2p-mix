@@ -14,12 +14,18 @@ import results
 import libp2p/peerstore
 import libp2p/peerid
 import libp2p/multiaddress
+import libp2p/peeraddrpolicy
+import libp2p/wire
 import libp2p/crypto/crypto
 import libp2p/crypto/curve25519
 import ./mix_node
 import ./multiaddr as mix_multiaddr
 
 export mix_node.MixPubInfo
+
+const publicDirectAddressPolicy* = proc(ma: MultiAddress): bool {.gcsafe, raises: [].} =
+  ## Accepts a public address that is not a circuit-relay address.
+  isPublicMA(ma) and not isCircuitRelayMA(ma)
 
 type MixPubKeyBook* = ref object of PeerBook[Curve25519Key]
   ## Tracks Curve25519 mix public keys per peer. Defined here so the mix
@@ -34,38 +40,65 @@ func isSupportedMultiaddr(maddr: MultiAddress): bool =
     return false
   TCP_IP4.match(baseAddr) or QUIC_V1_IP4.match(baseAddr)
 
-func findSupportedMultiaddr(maddrs: seq[MultiAddress]): Opt[MultiAddress] =
-  ## Returns the first multiaddress that is supported by the mix protocol.
-  for maddr in maddrs:
-    if isSupportedMultiaddr(maddr):
-      return Opt.some(maddr)
-  Opt.none(MultiAddress)
-
 type MixNodePool* = ref object of RootObj
   ## Manages mix node public information through its own record of added
   ## nodes and the peerStore.
   ## This abstraction allows the mix protocol to interact with mix node data
   ## without directly coupling to peerStore implementation details.
   ## An application can make a subclass that overrides `add`, `remove`, `get`,
-  ## `peerIds` and `len`. A subclass that does not get a peer store from `new`
-  ## overrides `add`, `remove`, `get` and `peerIds`, because these base methods
-  ## use the peer store.
+  ## `peerIds`, `len` and `accepts`. A subclass that does not get a peer store
+  ## from `new` overrides `add`, `remove`, `get` and `peerIds`, because these
+  ## base methods use the peer store. With a nil policy, the base `accepts`
+  ## returns true for each address that the mix protocol supports.
   ##
   ## Future enhancements:
   ## - Peer scoring: Track node reliability, latency, and performance metrics
   ## - Pool maintenance: Automatic pruning of stale/unresponsive nodes
   peerStore: PeerStore
+  addressPolicy: PeerAddressPolicy
+    ## Decides which hop addresses the pool uses. The default accepts every address.
+    ## The base `peerIds` and `len` still count a node that the policy refuses.
+    ## A send that draws it for a forward path removes it from the pool. A reply
+    ## path or a cover packet that draws it fails, and the node stays in the pool.
   added: Table[PeerId, MixPubInfo]
     ## The nodes added through `add`. `get` reads them from this table first.
 
-proc init*(pool: MixNodePool, peerStore: PeerStore) =
-  ## Sets the peer store of a pool, for a subclass that builds its own object
-  ## and keeps the base methods.
+proc init*(
+    pool: MixNodePool,
+    peerStore: PeerStore,
+    addressPolicy: PeerAddressPolicy = defaultAddressPolicy,
+) =
+  ## Sets the peer store and the address policy of a pool, for a subclass that
+  ## builds its own object and keeps the base methods.
   pool.peerStore = peerStore
+  pool.addressPolicy = addressPolicy
 
-proc new*(T: typedesc[MixNodePool], peerStore: PeerStore): T =
+proc new*(
+    T: typedesc[MixNodePool],
+    peerStore: PeerStore,
+    addressPolicy: PeerAddressPolicy = defaultAddressPolicy,
+): T =
   ## Create a new MixNodePool instance backed by the given peerStore.
-  T(peerStore: peerStore)
+  T(peerStore: peerStore, addressPolicy: addressPolicy)
+
+method accepts*(
+    pool: MixNodePool, maddr: MultiAddress
+): bool {.base, gcsafe, raises: [].} =
+  ## Returns true if the mix protocol supports the multiaddress and the
+  ## address policy of the pool accepts it. With a nil policy it checks only
+  ## the mix protocol. libp2p `accepts` has no nil check before 2.4.0, so this
+  ## method calls the policy itself. A subclass with its own policy overrides it.
+  isSupportedMultiaddr(maddr) and
+    (pool.addressPolicy.isNil() or pool.addressPolicy(maddr))
+
+proc firstAcceptedMultiaddr(
+    pool: MixNodePool, maddrs: seq[MultiAddress]
+): Opt[MultiAddress] =
+  ## Returns the first multiaddress that the pool accepts.
+  for maddr in maddrs:
+    if pool.accepts(maddr):
+      return Opt.some(maddr)
+  Opt.none(MultiAddress)
 
 method add*(pool: MixNodePool, info: MixPubInfo) {.base, gcsafe, raises: [].} =
   ## Add a mix node to the pool.
@@ -112,17 +145,16 @@ method get*(
   ## Get MixPubInfo for a peer. Returns none if peer is not in the pool
   ## or if required information (address, key) is missing.
   ## For a node added through `add`, `get` reads the keys from the pool's own
-  ## record. The address is the last outbound address when it is supported,
-  ## then the first supported address of the address book, then the added
-  ## address.
+  ## record. The address is the first one that the pool accepts, out of the
+  ## last outbound address, then the address book, then the added address.
   pool.added.withValue(peerId, info):
     let lastSeenAddr = pool.peerStore[LastSeenOutboundBook][peerId]
-    if lastSeenAddr.isSome and isSupportedMultiaddr(lastSeenAddr.get):
+    if lastSeenAddr.isSome and pool.accepts(lastSeenAddr.get):
       return Opt.some(
         MixPubInfo.init(peerId, lastSeenAddr.get, info.mixPubKey, info.libp2pPubKey)
       )
     let addresses = pool.peerStore[AddressBook][peerId] & @[info.multiAddr]
-    let supportedAddr = findSupportedMultiaddr(addresses).valueOr:
+    let supportedAddr = pool.firstAcceptedMultiaddr(addresses).valueOr:
       return Opt.none(MixPubInfo)
     return Opt.some(
       MixPubInfo.init(peerId, supportedAddr, info.mixPubKey, info.libp2pPubKey)
@@ -133,13 +165,13 @@ method get*(
     return Opt.none(MixPubInfo)
 
   # Get the address - prefer LastSeenOutboundBook, fall back to AddressBook
-  # Mix protocol only supports IPv4 addresses with TCP or QUIC-v1 transports
+  # The address is the first one that the pool accepts
   var supportedAddr: MultiAddress
   let lastSeenAddr = pool.peerStore[LastSeenOutboundBook][peerId]
-  if lastSeenAddr.isSome and isSupportedMultiaddr(lastSeenAddr.get):
+  if lastSeenAddr.isSome and pool.accepts(lastSeenAddr.get):
     supportedAddr = lastSeenAddr.get
   else:
-    supportedAddr = findSupportedMultiaddr(pool.peerStore[AddressBook][peerId]).valueOr:
+    supportedAddr = pool.firstAcceptedMultiaddr(pool.peerStore[AddressBook][peerId]).valueOr:
       return Opt.none(MixPubInfo)
 
   let pubKey = pool.peerStore[KeyBook][peerId]

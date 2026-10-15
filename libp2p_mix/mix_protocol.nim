@@ -13,6 +13,7 @@ import libp2p/protocols/protocol
 import libp2p/stream/[connection, lpstream]
 import libp2p/[switch, multicodec, peerinfo, varint]
 import libp2p/crypto/crypto
+import libp2p/peeraddrpolicy
 
 export pool
 export SurbStore, SurbSession
@@ -793,7 +794,8 @@ proc anonymizeLocalProtocolSend*(
 
   debug "Destination data", destination
 
-  if mixProto.nodePool.get(destination.peerId).isSome:
+  let destUsable = mixProto.nodePool.get(destination.peerId).isSome
+  if destUsable:
     numAvailableNodes = numMixNodes - 1
 
   if numAvailableNodes < PathLength:
@@ -808,7 +810,9 @@ proc anonymizeLocalProtocolSend*(
   let index = poolPeerIds.find(destination.peerId)
   if index != -1:
     availableIndices.del(index)
-  elif destination.kind == MixNode:
+  # A destination that `get` refuses, for example by the address policy, cannot
+  # be the last hop.
+  if destination.kind == MixNode and not destUsable:
     return err("Destination does not support mix")
 
   var nextHopAddr: MultiAddress
@@ -1120,8 +1124,11 @@ proc init*(
     delayStrategy: Opt[DelayStrategy] = Opt.none(DelayStrategy),
     coverTraffic: Opt[CoverTraffic] = Opt.none(CoverTraffic),
     surbStore: SurbStore = nil,
+    addressPolicy: PeerAddressPolicy = defaultAddressPolicy,
 ) {.raises: [].} =
   ## Initialize a MixProtocol instance.
+  ##
+  ## `addressPolicy` decides which hop addresses the node pool uses.
   ##
   ## A nil `surbStore` gets a default one. Defaulting to nil rather than
   ## `SurbStore.new()` keeps the constructor out of the parameter list, so
@@ -1152,7 +1159,7 @@ proc init*(
   mixProto.mixNodeInfo = mixNodeInfo
   mixProto.switch = switch
   mixProto.rng = switch.rng
-  mixProto.nodePool = MixNodePool.new(switch.peerStore)
+  mixProto.nodePool = MixNodePool.new(switch.peerStore, addressPolicy)
   mixProto.tagManager = tagManager
   mixProto.surbStore = store
   mixProto.destReadBehaviors = newTable[string, DestReadBehavior]()
@@ -1236,6 +1243,7 @@ proc new*(
     delayStrategy: Opt[DelayStrategy] = Opt.none(DelayStrategy),
     coverTraffic: Opt[CoverTraffic] = Opt.none(CoverTraffic),
     surbStore: SurbStore = nil,
+    addressPolicy: PeerAddressPolicy = defaultAddressPolicy,
 ): T {.raises: [].} =
   ## Create a new MixProtocol instance.
   ##
@@ -1248,6 +1256,6 @@ proc new*(
   let mixProto = new(T)
   mixProto.init(
     mixNodeInfo, switch, tagManager, spamProtection, delayStrategy, coverTraffic,
-    surbStore,
+    surbStore, addressPolicy,
   )
   mixProto

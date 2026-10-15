@@ -3,7 +3,7 @@
 
 {.used.}
 
-import results, sequtils, sets, tables
+import chronos, results, sequtils, sets, tables
 import
   libp2p/
     [crypto/crypto, crypto/curve25519, crypto/secp, multiaddress, peerid, peerstore]
@@ -264,6 +264,81 @@ suite "MixNodePool Tests":
       pool.peerIds().toHashSet() == [added.peerId, written.peerId].toHashSet()
       pool.get(written.peerId) == Opt.some(written)
 
+  test "the address policy decides which hop addresses the pool uses":
+    let strictPool = MixNodePool.new(peerStore, publicDirectAddressPolicy)
+    let pubInfo = mixNodes[0].toMixPubInfo()
+    let relayPeerId = PeerId.random(rng()).expect("could not generate relay peerId")
+    let privateAddr = MultiAddress.init("/ip4/192.168.1.1/tcp/4242").expect(
+        "could not create multiaddr"
+      )
+    # `isPublicMA` refuses the documentation ranges, so the public addresses here
+    # are outside them.
+    let publicAddr =
+      MultiAddress.init("/ip4/8.8.8.7/tcp/4243").expect("could not create multiaddr")
+    let circuitAddr = MultiAddress
+      .init("/ip4/8.8.8.8/tcp/4244/p2p/" & $relayPeerId & "/p2p-circuit")
+      .expect("could not create multiaddr")
+
+    var added = pubInfo
+    added.multiAddr = privateAddr
+    strictPool.add(added)
+    pool.add(added)
+    check strictPool.get(pubInfo.peerId).isNone
+    check pool.get(pubInfo.peerId).get().multiAddr == privateAddr
+
+    peerStore[AddressBook][pubInfo.peerId] = @[circuitAddr, publicAddr]
+    check strictPool.get(pubInfo.peerId).get().multiAddr == publicAddr
+    check pool.get(pubInfo.peerId).get().multiAddr == circuitAddr
+
+    peerStore[LastSeenOutboundBook][pubInfo.peerId] = Opt.some(privateAddr)
+    check strictPool.get(pubInfo.peerId).get().multiAddr == publicAddr
+    check pool.get(pubInfo.peerId).get().multiAddr == privateAddr
+
+    peerStore[AddressBook][pubInfo.peerId] = @[circuitAddr]
+    check strictPool.get(pubInfo.peerId).isNone
+    check pool.get(pubInfo.peerId).get().multiAddr == privateAddr
+
+  test "the address policy decides the hop address of a node written to the books":
+    let strictPool = MixNodePool.new(peerStore, publicDirectAddressPolicy)
+    let info = mixNodes[0].toMixPubInfo()
+    let privateAddr = MultiAddress.init("/ip4/192.168.1.1/tcp/4242").expect(
+        "could not create multiaddr"
+      )
+    let publicAddr =
+      MultiAddress.init("/ip4/8.8.8.7/tcp/4243").expect("could not create multiaddr")
+    peerStore[MixPubKeyBook][info.peerId] = info.mixPubKey
+    peerStore[KeyBook][info.peerId] =
+      PublicKey(scheme: Secp256k1, skkey: info.libp2pPubKey)
+    peerStore[AddressBook][info.peerId] = @[privateAddr]
+    check strictPool.get(info.peerId).isNone
+    check pool.get(info.peerId).get().multiAddr == privateAddr
+
+    peerStore[AddressBook][info.peerId] = @[privateAddr, publicAddr]
+    peerStore[LastSeenOutboundBook][info.peerId] = Opt.some(privateAddr)
+    check strictPool.get(info.peerId).get().multiAddr == publicAddr
+    check pool.get(info.peerId).get().multiAddr == privateAddr
+
+  test "a nil address policy accepts each address that the mix protocol supports":
+    let nilPolicyPool = MixNodePool.new(peerStore, nil)
+    let info = mixNodes[0].toMixPubInfo()
+    nilPolicyPool.add(info)
+    check nilPolicyPool.get(info.peerId) == Opt.some(info)
+
+  test "the protocol passes the address policy to its pool":
+    let info = mixNodes[0]
+    let node = MixProtocol.new(
+      info,
+      createSwitch(info.multiAddr, Opt.some(info.libp2pPrivKey)),
+      addressPolicy = publicDirectAddressPolicy,
+    )
+    var hop = mixNodes[1].toMixPubInfo()
+    node.nodePool.add(hop)
+    check node.nodePool.get(hop.peerId).isNone
+    hop.multiAddr =
+      MultiAddress.init("/ip4/8.8.8.9/tcp/4245").expect("could not create multiaddr")
+    node.nodePool.add(hop)
+    check node.nodePool.get(hop.peerId) == Opt.some(hop)
+
   test "multiple operations sequence":
     # Add 3 nodes
     for i in 0 ..< 3:
@@ -315,7 +390,40 @@ method peerIds(pool: FakePool): seq[PeerId] {.gcsafe, raises: [].} =
 method len(pool: FakePool): int {.gcsafe, raises: [].} =
   pool.members.len
 
+suite "MixNodePool address policy":
+  asyncTest "a send fails when the policy refuses its exitNode destination":
+    let infos = MixNodeInfo.generateRandomMany(6, rng())
+    let node = MixProtocol.new(
+      infos[0],
+      createSwitch(infos[0].multiAddr, Opt.some(infos[0].libp2pPrivKey)),
+      addressPolicy = publicDirectAddressPolicy,
+    )
+    for i, info in infos[1 .. 4]:
+      var hop = info.toMixPubInfo()
+      hop.multiAddr = MultiAddress.init("/ip4/8.8.8." & $(i + 10) & "/tcp/4242").expect(
+          "could not create multiaddr"
+        )
+      node.nodePool.add(hop)
+    var dest = infos[5].toMixPubInfo()
+    dest.multiAddr = MultiAddress.init("/ip4/192.168.1.1/tcp/4242").expect(
+        "could not create multiaddr"
+      )
+    node.nodePool.add(dest)
+    let res = await node.anonymizeLocalProtocolSend(
+      nil, @[1.byte, 2, 3], "/mix/test/1.0.0", MixDestination.exitNode(dest.peerId), 0
+    )
+    check res.isErr
+    check res.error == "Destination does not support mix"
+
 suite "MixNodePool subclass":
+  test "a subclass built with init takes the address policy":
+    let pool = BookPool()
+    pool.init(PeerStore.new(), publicDirectAddressPolicy)
+    let privateAddr = MultiAddress.init("/ip4/192.168.1.1/tcp/4242").expect(
+        "could not create multiaddr"
+      )
+    check not MixNodePool(pool).accepts(privateAddr)
+
   test "a subclass built with init keeps the base methods on the peer store":
     let peerStore = PeerStore.new()
     let pool = BookPool()
