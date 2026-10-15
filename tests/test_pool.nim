@@ -3,9 +3,9 @@
 
 {.used.}
 
-import results, sequtils
+import results, sequtils, tables
 import libp2p/[crypto/crypto, crypto/secp, multiaddress, peerid, peerstore]
-import libp2p_mix/[mix_node, pool]
+import libp2p_mix/[mix_node, pool, mix_protocol, serialization]
 import ./tools/unittest
 import ./tools/crypto
 import ./utils
@@ -231,3 +231,66 @@ suite "MixNodePool Tests":
       pool.add(pubInfo)
 
     check pool.len == 4
+
+type BookPool = ref object of MixNodePool ## A subclass that keeps every base method.
+
+type FakePool = ref object of MixNodePool
+  ## A pool that keeps its members in its own table and does not use the
+  ## peer store.
+  members: Table[PeerId, MixPubInfo]
+  getCalls: int
+
+method add(pool: FakePool, info: MixPubInfo) {.gcsafe, raises: [].} =
+  pool.members[info.peerId] = info
+
+method remove(pool: FakePool, peerId: PeerId): bool {.gcsafe, raises: [].} =
+  let present = pool.members.hasKey(peerId)
+  pool.members.del(peerId)
+  present
+
+method get(pool: FakePool, peerId: PeerId): Opt[MixPubInfo] {.gcsafe, raises: [].} =
+  inc pool.getCalls
+  pool.members.withValue(peerId, info):
+    return Opt.some(info[])
+  Opt.none(MixPubInfo)
+
+method peerIds(pool: FakePool): seq[PeerId] {.gcsafe, raises: [].} =
+  pool.members.keys.toSeq()
+
+method len(pool: FakePool): int {.gcsafe, raises: [].} =
+  pool.members.len
+
+suite "MixNodePool subclass":
+  test "a subclass built with init keeps the base methods on the peer store":
+    let peerStore = PeerStore.new()
+    let pool = BookPool()
+    pool.init(peerStore)
+    let pubInfo = MixNodeInfo.generateRandom(4242, rng()).toMixPubInfo()
+    MixNodePool(pool).add(pubInfo)
+    check:
+      peerStore[MixPubKeyBook][pubInfo.peerId] == pubInfo.mixPubKey
+      MixNodePool(pool).get(pubInfo.peerId) == Opt.some(pubInfo)
+      MixNodePool(pool).len == 1
+
+  test "buildSurb reads its hops from a subclass pool":
+    let infos = MixNodeInfo.generateRandomMany(5, rng())
+    let node = MixProtocol.new(
+      infos[0], createSwitch(infos[0].multiAddr, Opt.some(infos[0].libp2pPrivKey))
+    )
+    let pool = FakePool()
+    node.nodePool = pool
+    # Add through the base type, so that the test finds a base `add` proc.
+    for info in infos[1 .. ^1]:
+      node.nodePool.add(info.toMixPubInfo())
+    check node.nodePool.len == 4
+    let nonMember = PeerId.random(rng()).expect("could not generate peerId")
+    var id: SURBIdentifier
+    rng().generate(id)
+    check node.buildSurb(id, nonMember, nonMember).isOk
+    check pool.getCalls == 2
+    check node.switch.peerStore[MixPubKeyBook].len == 0
+    check node.nodePool.remove(infos[1].peerId)
+    check node.nodePool.len == 3
+    check node.buildSurb(id, nonMember, nonMember).isOk
+    check node.nodePool.remove(infos[2].peerId)
+    check node.buildSurb(id, nonMember, nonMember).isErr
