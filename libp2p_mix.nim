@@ -12,6 +12,8 @@ import chronos
 export toConnection
 export MixProtocolID
 export MixProtocol
+export MixHopDialOutcome
+export MixHopDialHandler
 
 export get
 export `new`

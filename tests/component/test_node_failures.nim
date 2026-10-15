@@ -417,3 +417,96 @@ suite "Mix Protocol - Node Failures":
 
     # Verify invalid node was removed from pool (the valid nodes remain)
     check senderPool.len == validNodesCount
+
+  asyncTest "the hop dial handler sees a successful, a cancelled and a failed dial":
+    ## The first send dials a live hop. Then the test puts three fake hops in
+    ## the pool in place of the live hops. The fake hops point at a server that
+    ## never answers, so the next dial stays in the handshake until the test
+    ## cancels the write. Then the test stops the server, so the last dial
+    ## fails.
+    let nodes = await ephemeralMixNodes(5)
+    defer:
+      await stopNodes(nodes)
+    let sender = nodes[0]
+    let destNode = nodes[4]
+    let echoProto = EchoProtocol.new()
+    await echoProto.start()
+    destNode.switch.mount(echoProto)
+    for node in nodes:
+      node.registerDestReadBehavior(echoProto.codec, readLp(EchoMaxReadLen))
+    var reports: seq[
+      tuple[
+        peerId: PeerId,
+        addresses: seq[MultiAddress],
+        outcome: MixHopDialOutcome,
+        hadConnection: bool,
+        error: ref CatchableError,
+      ]
+    ]
+    sender.onHopDial = proc(
+        peerId: PeerId,
+        addresses: seq[MultiAddress],
+        outcome: MixHopDialOutcome,
+        hadConnection: bool,
+        error: ref CatchableError,
+    ) {.gcsafe, raises: [].} =
+      reports.add((peerId, addresses, outcome, hadConnection, error))
+
+    block:
+      let conn = sender
+        .toConnection(destNode.toMixDestination(), echoProto.codec)
+        .expect("could not build connection")
+      defer:
+        await conn.close()
+      await conn.writeLp(@[1.byte, 2, 3])
+    check:
+      reports.len == 1
+      reports[0].outcome == MixHopDialOutcome.Succeeded
+      not reports[0].hadConnection
+      reports[0].peerId in sender.nodePool.peerIds()
+      reports[0].addresses == @[sender.nodePool.get(reports[0].peerId).get().multiAddr]
+      reports[0].error.isNil
+
+    let server = UnresponsiveServer.new()
+    defer:
+      await server.stop()
+    for hop in nodes[1 .. 3]:
+      discard sender.nodePool.remove(hop.localMixPubInfo().peerId)
+    let hops = fakeHops(3, server.address)
+    sender.nodePool.add(hops)
+    for peerId in sender.switch.connectedPeers():
+      await sender.switch.disconnect(peerId)
+    block:
+      let conn = sender
+        .toConnection(destNode.toMixDestination(), echoProto.codec)
+        .expect("could not build connection")
+      defer:
+        await conn.close()
+      let sending = conn.writeLp(@[1.byte, 2, 3])
+      checkUntilTimeout:
+        server.accepted > 0
+      await sending.cancelAndWait()
+    check:
+      reports.len == 2
+      reports[1].outcome == MixHopDialOutcome.Cancelled
+      not reports[1].hadConnection
+      reports[1].peerId in hops.mapIt(it.peerId)
+      reports[1].addresses == @[server.address]
+      reports[1].error.isNil
+
+    await server.stop()
+    block:
+      let conn = sender
+        .toConnection(destNode.toMixDestination(), echoProto.codec)
+        .expect("could not build connection")
+      defer:
+        await conn.close()
+      expect LPStreamError:
+        await conn.writeLp(@[1.byte, 2, 3])
+    check:
+      reports.len == 3
+      reports[2].outcome == MixHopDialOutcome.Failed
+      not reports[2].hadConnection
+      reports[2].peerId in hops.mapIt(it.peerId)
+      reports[2].addresses == @[server.address]
+      reports[2].error of DialFailedError
