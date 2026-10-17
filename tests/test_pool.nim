@@ -3,8 +3,10 @@
 
 {.used.}
 
-import results, sequtils, tables
-import libp2p/[crypto/crypto, crypto/secp, multiaddress, peerid, peerstore]
+import results, sequtils, sets, tables
+import
+  libp2p/
+    [crypto/crypto, crypto/curve25519, crypto/secp, multiaddress, peerid, peerstore]
 import libp2p_mix/[mix_node, pool, mix_protocol, serialization]
 import ./tools/unittest
 import ./tools/crypto
@@ -208,6 +210,59 @@ suite "MixNodePool Tests":
     # When LastSeenOutboundBook is empty, fall back to AddressBook
     peerStore[LastSeenOutboundBook][pubInfo.peerId] = Opt.none(MultiAddress)
     check pool.get(pubInfo.peerId).get().multiAddr == addressBookAddr
+
+  test "an added node uses the last outbound address, then the address book, then the added address":
+    var pubInfo = mixNodes[0].toMixPubInfo()
+    let addedAddr =
+      MultiAddress.init("/ip4/10.0.0.1/tcp/4241").expect("could not create multiaddr")
+    let bookAddr =
+      MultiAddress.init("/ip4/10.0.0.2/tcp/4242").expect("could not create multiaddr")
+    let lastSeenAddr =
+      MultiAddress.init("/ip4/10.0.0.3/tcp/4243").expect("could not create multiaddr")
+    pubInfo.multiAddr = addedAddr
+    pool.add(pubInfo)
+    peerStore[AddressBook][pubInfo.peerId] = @[bookAddr]
+    check pool.get(pubInfo.peerId).get().multiAddr == bookAddr
+    peerStore[LastSeenOutboundBook][pubInfo.peerId] = Opt.some(lastSeenAddr)
+    check pool.get(pubInfo.peerId).get().multiAddr == lastSeenAddr
+    peerStore.del(pubInfo.peerId)
+    check pool.get(pubInfo.peerId).get().multiAddr == addedAddr
+
+  test "an added node stays in the pool after the peer store deletes it":
+    let pubInfo = mixNodes[0].toMixPubInfo()
+    pool.add(pubInfo)
+    peerStore.del(pubInfo.peerId)
+    check:
+      peerStore[MixPubKeyBook][pubInfo.peerId] == default(Curve25519Key)
+      pool.len == 1
+      pubInfo.peerId in pool.peerIds()
+      pool.get(pubInfo.peerId) == Opt.some(pubInfo)
+    check pool.remove(pubInfo.peerId)
+    check:
+      pool.len == 0
+      pool.get(pubInfo.peerId).isNone
+
+  test "an added node keeps the keys of its record after a later write to the books":
+    let pubInfo = mixNodes[0].toMixPubInfo()
+    pool.add(pubInfo)
+    let other = mixNodes[1].toMixPubInfo()
+    peerStore[MixPubKeyBook][pubInfo.peerId] = other.mixPubKey
+    peerStore[KeyBook][pubInfo.peerId] =
+      PublicKey(scheme: Secp256k1, skkey: other.libp2pPubKey)
+    check pool.get(pubInfo.peerId) == Opt.some(pubInfo)
+
+  test "an added node and a node written to the books count once each":
+    let added = mixNodes[0].toMixPubInfo()
+    let written = mixNodes[1].toMixPubInfo()
+    pool.add(added)
+    peerStore[MixPubKeyBook][written.peerId] = written.mixPubKey
+    peerStore[AddressBook][written.peerId] = @[written.multiAddr]
+    peerStore[KeyBook][written.peerId] =
+      PublicKey(scheme: Secp256k1, skkey: written.libp2pPubKey)
+    check:
+      pool.len == 2
+      pool.peerIds().toHashSet() == [added.peerId, written.peerId].toHashSet()
+      pool.get(written.peerId) == Opt.some(written)
 
   test "multiple operations sequence":
     # Add 3 nodes
