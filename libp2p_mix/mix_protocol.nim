@@ -891,21 +891,22 @@ proc anonymizeLocalProtocolSend*(
 
   let session = prepared.session
 
-  # Past this point the reply credentials are registered, so every failure
-  # must release them: the packet never left this process, so no reply can
-  # ever arrive to clean them up.
-  template releaseAndFail(msg: string): auto =
-    session.get(nil).release()
-    return err(msg)
+  # Past this point the reply credentials are registered. The caller gets the
+  # handle to them only when the send completes, so every other exit releases
+  # them here.
+  var sent = false
+  defer:
+    if not sent:
+      session.get(nil).release()
 
   let message = buildMessage(move(prepared.msg), codec).valueOr:
     mix_messages_error.inc(labelValues = ["Entry", error[1]])
-    releaseAndFail(fmt"Error building message: {error[0]}")
+    return err(fmt"Error building message: {error[0]}")
 
   # Wrap in Sphinx packet
   let sphinxPacket = wrapInSphinxPacket(message, publicKeys, delays, hop, destHop).valueOr:
     mix_messages_error.inc(labelValues = ["Entry", "NON_RECOVERABLE"])
-    releaseAndFail(fmt"Failed to wrap in sphinx packet: {error}")
+    return err(fmt"Failed to wrap in sphinx packet: {error}")
 
   # Claim a slot for local origination (Mix Cover Traffic spec §6.3).
   # Claimed here rather than on entry so that a slot is only consumed by a
@@ -915,7 +916,7 @@ proc anonymizeLocalProtocolSend*(
     let claim = ct.slotPool.claimSlot()
     if not claim.success:
       mix_slot_claim_rejected.inc(labelValues = ["send"])
-      releaseAndFail("No slots available in current epoch")
+      return err("No slots available in current epoch")
     # Reclaim proof token from discarded cover packet for messageId reuse
     if claim.reclaimedToken.len > 0:
       mixProto.spamProtection.withValue(sp):
@@ -923,8 +924,9 @@ proc anonymizeLocalProtocolSend*(
 
   # Send the wrapped message to the first mix node in the selected path
   (await mixProto.sendPacket(nextHopPeerId, nextHopAddr, sphinxPacket, logConfig)).isOkOr:
-    releaseAndFail(error)
+    return err(error)
 
+  sent = true
   return ok(session)
 
 proc sendSurbReply*(

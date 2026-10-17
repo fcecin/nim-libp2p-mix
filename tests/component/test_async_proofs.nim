@@ -231,3 +231,114 @@ suite "Asynchronous proof provider":
     await sending.cancelAndWait()
     check providers[0].cancelled
     check not providers[0].pending
+
+  asyncTest "a pending request refuses a second write and releases its reply credentials on a cancel or a close":
+    ## The provider blocks inside `sendPacket`, after the reply credentials
+    ## are registered. A cancel and a close must both release them, and
+    ## `write` refuses a second write on a pending request.
+    var infos = MixNodeInfo.generateRandomMany(5, rng())
+    for info in infos.mitems:
+      info.multiAddr = MultiAddress.init("/ip4/127.0.0.1/tcp/0").tryGet()
+    var nodes: seq[MixProtocol]
+    let provider = AsyncProofs(proofSize: 1, blocked: true)
+    for i, info in infos:
+      let sw = createSwitch(info.multiAddr, Opt.some(info.libp2pPrivKey))
+      let sp =
+        if i == 0:
+          provider
+        else:
+          AsyncProofs(proofSize: 1)
+      let node = MixProtocol.new(
+        info,
+        sw,
+        spamProtection = Opt.some(SpamProtection(sp)),
+        delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
+      )
+      for other in infos:
+        if other.peerId != info.peerId:
+          node.nodePool.add(other.toMixPubInfo())
+      sw.mount(node)
+      nodes.add(node)
+    startAndDeferStop(nodes)
+    let sender = nodes[0]
+    let destination = MixDestination.exitNode(infos[4].peerId)
+    let params = MixParameters(expectReply: Opt.some(true), numSurbs: Opt.some(1'u8))
+    sender.registerDestReadBehavior("/mix/test/cancel/1.0.0", readLp(32))
+    sender.registerDestReadBehavior("/mix/test/close/1.0.0", readLp(32))
+
+    let connToCancel =
+      sender.toConnection(destination, "/mix/test/cancel/1.0.0", params).tryGet()
+    defer:
+      await connToCancel.close()
+    let sending = connToCancel.writeLp(@[1.byte, 2, 3])
+    checkUntilTimeout:
+      provider.pending
+    check sender.surbCredsLen == 1
+    expect LPStreamError:
+      await connToCancel.writeLp(@[4.byte, 5, 6])
+    await sending.cancelAndWait()
+    check provider.cancelled
+    check sender.surbCredsLen == 0
+
+    provider.cancelled = false
+    let connToClose =
+      sender.toConnection(destination, "/mix/test/close/1.0.0", params).tryGet()
+    let writing = connToClose.writeLp(@[1.byte, 2, 3])
+    checkUntilTimeout:
+      provider.pending
+    check sender.surbCredsLen == 1
+    await connToClose.close()
+    expect LPStreamClosedError:
+      await writing
+    check provider.cancelled
+    check sender.surbCredsLen == 0
+    expect LPStreamClosedError:
+      await connToClose.writeLp(@[4.byte, 5, 6])
+    check sender.surbCredsLen == 0
+
+  asyncTest "a close does not cancel a fire-and-forget write, and a write after the close fails":
+    ## The provider blocks inside `sendPacket`. A close of a fire-and-forget
+    ## connection does not cancel the pending write.
+    var infos = MixNodeInfo.generateRandomMany(5, rng())
+    for info in infos.mitems:
+      info.multiAddr = MultiAddress.init("/ip4/127.0.0.1/tcp/0").tryGet()
+    var nodes: seq[MixProtocol]
+    let provider = AsyncProofs(proofSize: 1, proofGate: newAsyncEvent())
+    for i, info in infos:
+      let sw = createSwitch(info.multiAddr, Opt.some(info.libp2pPrivKey))
+      let sp =
+        if i == 0:
+          provider
+        else:
+          AsyncProofs(proofSize: 1)
+      let node = MixProtocol.new(
+        info,
+        sw,
+        spamProtection = Opt.some(SpamProtection(sp)),
+        delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
+      )
+      sw.mount(node)
+      nodes.add(node)
+    startAndDeferStop(nodes)
+    # The pools get the listen addresses, so the send reaches the first hop.
+    for node in nodes:
+      node.setLocalMultiAddr(node.switch.peerInfo.addrs[0]).expect("bound address")
+    for node in nodes:
+      for other in nodes:
+        if other != node:
+          node.nodePool.add(other.localMixPubInfo())
+    let sender = nodes[0]
+    let destination = MixDestination.exitNode(infos[4].peerId)
+
+    let conn =
+      sender.toConnection(destination, "/mix/test/fire-and-forget/1.0.0").tryGet()
+    let writing = conn.writeLp(@[1.byte, 2, 3])
+    checkUntilTimeout:
+      provider.pending
+    await conn.close()
+    check not writing.finished()
+    provider.proofGate.fire()
+    await writing
+    check not provider.cancelled
+    expect LPStreamClosedError:
+      await conn.writeLp(@[4.byte, 5, 6])
