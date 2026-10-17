@@ -43,6 +43,7 @@ export MixNodePool
 export add
 export remove
 export peerIds
+export publicDirectAddressPolicy
 
 proc readLp*(maxSize: int): DestReadBehavior =
   ## Create a read behavior that reads length-prefixed messages (varint-encoded length).
