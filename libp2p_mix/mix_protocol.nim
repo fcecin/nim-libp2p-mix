@@ -84,12 +84,6 @@ proc setLocalMultiAddr*(
 proc surbCredsLen*(mixProto: MixProtocol): int =
   mixProto.surbStore.len
 
-proc cryptoRandomInt(rng: Rng, max: int): Result[int, string] =
-  if max == 0:
-    return err("Max cannot be zero.")
-  let res = rng.generate(uint64) mod uint64(max)
-  ok(res.int)
-
 proc removeClosedConnections(
     mixProto: MixProtocol, pid: PeerId
 ) {.async: (raises: []).} =
@@ -542,11 +536,10 @@ method buildSurb*(
   for i in 0 ..< PathLength:
     let (peerId, multiAddr, mixPubKey, hopDelay) =
       if i < PathLength - 1:
-        let randomIndexPosition = cryptoRandomInt(mixProto.rng, availableIndices.len).valueOr:
-          return err("failed to generate random num: " & error)
-        let selectedIndex = availableIndices[randomIndexPosition]
+        let selectedIndex = mixProto.rng.pickOne(availableIndices).valueOr:
+          return err("No. of public mix nodes less than path length")
         let randPeerId = poolPeerIds[selectedIndex]
-        availableIndices.del(randomIndexPosition)
+        availableIndices.del(availableIndices.find(selectedIndex))
         debug "Selected mix node for surbs: ", indexInPath = i, peerId = randPeerId
         let mixPubInfo = mixProto.nodePool.get(randPeerId).valueOr:
           return err("could not get mix pub info for peer: " & $randPeerId)
@@ -825,12 +818,11 @@ proc anonymizeLocalProtocolSend*(
       mix_messages_error.inc(labelValues = ["Entry", "LOW_MIX_POOL"])
       return err("Ran out of available mix nodes while constructing path")
 
-    let randomIndexPosition = cryptoRandomInt(mixProto.rng, availableIndices.len).valueOr:
-      mix_messages_error.inc(labelValues = ["Entry", "NON_RECOVERABLE"])
-      return err(fmt"Failed to generate random number: {error}")
-    let selectedIndex = availableIndices[randomIndexPosition]
+    let selectedIndex = mixProto.rng.pickOne(availableIndices).valueOr:
+      mix_messages_error.inc(labelValues = ["Entry", "LOW_MIX_POOL"])
+      return err("Ran out of available mix nodes while constructing path")
     var randPeerId = poolPeerIds[selectedIndex]
-    availableIndices.del(randomIndexPosition)
+    availableIndices.del(availableIndices.find(selectedIndex))
 
     if destination.kind == ForwardAddr and randPeerId == destination.peerId:
       continue
