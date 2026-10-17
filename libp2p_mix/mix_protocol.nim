@@ -109,6 +109,11 @@ proc setLocalMultiAddr*(
 proc surbCredsLen*(mixProto: MixProtocol): int =
   mixProto.surbStore.len
 
+func delayStrategy*(mixProto: MixProtocol): DelayStrategy =
+  ## The delay strategy of the protocol, for a subclass that builds its own
+  ## paths.
+  mixProto.delayStrategy
+
 proc removeClosedConnections(
     mixProto: MixProtocol, pid: PeerId
 ) {.async: (raises: []).} =
