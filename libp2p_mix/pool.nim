@@ -39,21 +39,30 @@ func findSupportedMultiaddr(maddrs: seq[MultiAddress]): Opt[MultiAddress] =
       return Opt.some(maddr)
   Opt.none(MultiAddress)
 
-type MixNodePool* = ref object
+type MixNodePool* = ref object of RootObj
   ## Manages mix node public information through the peerStore.
   ## This abstraction allows the mix protocol to interact with mix node data
   ## without directly coupling to peerStore implementation details.
+  ## An application can make a subclass that overrides `add`, `remove`, `get`,
+  ## `peerIds` and `len`. A subclass that does not get a peer store from `new`
+  ## overrides `add`, `remove`, `get` and `peerIds`, because these base methods
+  ## use the peer store.
   ##
   ## Future enhancements:
   ## - Peer scoring: Track node reliability, latency, and performance metrics
   ## - Pool maintenance: Automatic pruning of stale/unresponsive nodes
   peerStore: PeerStore
 
+proc init*(pool: MixNodePool, peerStore: PeerStore) =
+  ## Sets the peer store of a pool, for a subclass that builds its own object
+  ## and keeps the base methods.
+  pool.peerStore = peerStore
+
 proc new*(T: typedesc[MixNodePool], peerStore: PeerStore): T =
   ## Create a new MixNodePool instance backed by the given peerStore.
   T(peerStore: peerStore)
 
-proc add*(pool: MixNodePool, info: MixPubInfo) =
+method add*(pool: MixNodePool, info: MixPubInfo) {.base, gcsafe, raises: [].} =
   ## Add a mix node to the pool.
   ## MixPubKeyBook entry is always updated.
   ## Address is added to AddressBook if not already present.
@@ -81,12 +90,14 @@ proc add*(pool: MixNodePool, infos: seq[MixPubInfo]) =
   for info in infos:
     pool.add(info)
 
-proc remove*(pool: MixNodePool, peerId: PeerId): bool =
+method remove*(pool: MixNodePool, peerId: PeerId): bool {.base, gcsafe, raises: [].} =
   ## Remove a mix node from the pool. Returns true if the node was present.
   pool.peerStore[MixPubKeyBook].del(peerId)
   # Preserve AddressBook/KeyBook entries used by other protocols.
 
-proc get*(pool: MixNodePool, peerId: PeerId): Opt[MixPubInfo] =
+method get*(
+    pool: MixNodePool, peerId: PeerId
+): Opt[MixPubInfo] {.base, gcsafe, raises: [].} =
   ## Get MixPubInfo for a peer. Returns none if peer is not in the pool
   ## or if required information (address, key) is missing.
   let mixPubKey = pool.peerStore[MixPubKeyBook][peerId]
@@ -109,10 +120,12 @@ proc get*(pool: MixNodePool, peerId: PeerId): Opt[MixPubInfo] =
 
   Opt.some(MixPubInfo.init(peerId, supportedAddr, mixPubKey, pubKey.skkey))
 
-proc peerIds*(pool: MixNodePool): seq[PeerId] =
+method peerIds*(pool: MixNodePool): seq[PeerId] {.base, gcsafe, raises: [].} =
   ## Get all peer IDs in the mix node pool.
+  ## A subclass returns the nodes that a path can use now.
   pool.peerStore[MixPubKeyBook].book.keys.toSeq()
 
-proc len*(pool: MixNodePool): int =
+method len*(pool: MixNodePool): int {.base, gcsafe, raises: [].} =
   ## Get the number of mix nodes in the pool.
-  pool.peerStore[MixPubKeyBook].len
+  ## A subclass that overrides `len` returns the number of nodes in `peerIds`.
+  pool.peerIds().len
