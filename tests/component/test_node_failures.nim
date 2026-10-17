@@ -338,7 +338,7 @@ suite "Mix Protocol - Node Failures":
   asyncTest "skip and remove nodes with invalid multiaddress from pool":
     # This test validates that nodes with invalid multiaddrs are:
     # 1. Skipped during path construction
-    # 2. Removed from peerStore MixPubKeyBook
+    # 2. Removed from the pool
     # 3. Message still succeeds if enough valid nodes remain
 
     # Setup all mix protocol nodes (needed for forwarding)
@@ -371,29 +371,16 @@ suite "Mix Protocol - Node Failures":
     for i in 1 ..< validNodesCount + 1:
       savedPubInfos.add(nodes[0].nodePool.get(nodes[i].switch.peerInfo.peerId).get())
 
-    # Now inject invalid node into sender's (node 0) peerStore
-    # Include enough valid nodes so that even after invalid node is removed,
-    # we still have sufficient nodes for PathLength = 3
-    # First clear the existing MixPubKeyBook entries for sender's switch
-    let senderPeerStore = nodes[0].switch.peerStore
-    for peerId in senderPeerStore[MixPubKeyBook].book.keys.toSeq():
-      discard senderPeerStore[MixPubKeyBook].del(peerId)
-
-    # Add valid nodes to peerStore
-    for pubInfo in savedPubInfos:
-      senderPeerStore[MixPubKeyBook][pubInfo.peerId] = pubInfo.mixPubKey
-      senderPeerStore[AddressBook][pubInfo.peerId] = @[pubInfo.multiAddr]
-      senderPeerStore[KeyBook][pubInfo.peerId] =
-        PublicKey(scheme: Secp256k1, skkey: pubInfo.libp2pPubKey)
-
-    # Add invalid node to peerStore
-    senderPeerStore[MixPubKeyBook][invalidPeerId] = invalidPubInfo.mixPubKey
-    senderPeerStore[AddressBook][invalidPeerId] = @[invalidPubInfo.multiAddr]
-    senderPeerStore[KeyBook][invalidPeerId] =
-      PublicKey(scheme: Secp256k1, skkey: invalidPubInfo.libp2pPubKey)
+    # Give the sender (node 0) a pool of the valid nodes and the invalid node.
+    # The pool keeps its added nodes, so the test calls `remove` for each old node.
+    let senderPool = nodes[0].nodePool
+    for peerId in senderPool.peerIds():
+      discard senderPool.remove(peerId)
+    senderPool.add(savedPubInfos)
+    senderPool.add(invalidPubInfo)
 
     # Verify pool has validNodesCount + 1 invalid node
-    check senderPeerStore[MixPubKeyBook].len == validNodesCount + 1
+    check senderPool.len == validNodesCount + 1
 
     # Setup destination node
     let nrProto = NoReplyProtocol.new()
@@ -404,14 +391,14 @@ suite "Mix Protocol - Node Failures":
     startAndDeferStop(nodes)
 
     # Send messages in a loop until invalid node is encountered and removed
-    # With validNodesCount + 1 invalid nodes and PathLength=3, we need multiple attempts
+    # With validNodesCount valid nodes, one invalid node and PathLength=3, we need multiple attempts
     let testPayload = "test message".toBytes()
-    var initialPoolSize = senderPeerStore[MixPubKeyBook].len
+    var initialPoolSize = senderPool.len
 
     # Try up to 20 times to encounter the invalid node
     # Stop if pool size goes below PathLength (can't construct path anymore)
     for attempt in 0 ..< 20:
-      if senderPeerStore[MixPubKeyBook].len < PathLength:
+      if senderPool.len < PathLength:
         break
 
       let conn = nodes[0].toConnection(nodes[1].toMixDestination(), nrProto.codec)
@@ -425,8 +412,8 @@ suite "Mix Protocol - Node Failures":
       await conn.get().close()
 
       # Check if invalid node was removed
-      if senderPeerStore[MixPubKeyBook].len < initialPoolSize:
+      if senderPool.len < initialPoolSize:
         break
 
-    # Verify invalid node was removed from pool (should be 6 valid nodes remaining)
-    check senderPeerStore[MixPubKeyBook].len == validNodesCount
+    # Verify invalid node was removed from pool (the valid nodes remain)
+    check senderPool.len == validNodesCount
