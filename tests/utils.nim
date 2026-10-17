@@ -3,7 +3,7 @@
 
 {.used.}
 
-import chronos, results, strformat
+import chronos, results, sequtils, strformat
 import
   libp2p/
     [protocols/ping, peerid, multiaddress, switch, builders, crypto/crypto, crypto/secp]
@@ -12,7 +12,7 @@ import libp2p_mix/mix_protocol
 import libp2p_mix/curve25519
 import libp2p_mix/delay_strategy
 
-import ./tools/[unittest, crypto]
+import ./tools/[unittest, crypto, lifecycle]
 import ./[mock_mix, spam_protection_impl]
 
 proc createSwitch*(
@@ -234,3 +234,75 @@ method generateForEntry*(self: FixedDelayStrategy): Delay =
 
 method generateForIntermediate*(self: FixedDelayStrategy, encodedDelay: Delay): Delay =
   self.delay
+
+###
+
+type UnresponsiveServer* = ref object
+  ## A TCP server that accepts a connection and never answers on it. A libp2p
+  ## dial to `address` stays in the handshake until the dialer cancels it or
+  ## its timeout ends it.
+  server: StreamServer
+  transports: seq[StreamTransport]
+  stopped: bool
+  address*: MultiAddress
+
+proc new*(T: typedesc[UnresponsiveServer]): T =
+  let server = T()
+  proc accept(
+      streamServer: StreamServer, transport: StreamTransport
+  ) {.async: (raises: []).} =
+    server.transports.add(transport)
+
+  server.server = createStreamServer(initTAddress("127.0.0.1:0"), accept)
+  server.server.start()
+  server.address = MultiAddress.init(server.server.localAddress()).tryGet()
+  server
+
+func accepted*(server: UnresponsiveServer): int =
+  ## Returns the number of connections that the server accepted.
+  server.transports.len
+
+proc stop*(server: UnresponsiveServer) {.async: (raises: []).} =
+  ## Closes the accepted connections and the server. A second call does
+  ## nothing.
+  if server.stopped:
+    return
+  server.stopped = true
+  for transport in server.transports:
+    await transport.closeWait()
+  try:
+    server.server.stop()
+  except TransportOsError:
+    discard
+  await server.server.closeWait()
+
+proc ephemeralMixNodes*(count: int): Future[seq[MixProtocol]] {.async.} =
+  ## Builds and starts `count` mix nodes on loopback. Each node listens on a
+  ## port that the OS assigns, uses `NoSamplingDelayStrategy`, and has every
+  ## other node in its pool.
+  var nodes: seq[MixProtocol]
+  for _ in 0 ..< count:
+    var info = MixNodeInfo.generateRandom(0, rng())
+    info.multiAddr = MultiAddress.init("/ip4/127.0.0.1/tcp/0").tryGet()
+    let sw = createSwitch(info.multiAddr, Opt.some(info.libp2pPrivKey))
+    let node = MixProtocol.new(
+      info,
+      sw,
+      delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
+    )
+    sw.mount(node)
+    nodes.add(node)
+  await startNodes(nodes)
+  for node in nodes:
+    doAssert node.setLocalMultiAddr(node.switch.peerInfo.addrs[0]).isOk
+  for node in nodes:
+    for other in nodes:
+      if node != other:
+        node.nodePool.add(other.localMixPubInfo())
+  nodes
+
+proc fakeHops*(count: int, address: MultiAddress): seq[MixPubInfo] =
+  ## Returns `count` fake hop records with random keys and one shared address.
+  MixNodeInfo.generateRandomMany(count, rng()).mapIt(
+    MixPubInfo.init(it.peerId, address, it.mixPubKey, it.libp2pPubKey)
+  )

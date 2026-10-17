@@ -35,6 +35,28 @@ func isCoverTraffic*(msg: MixMessage): bool =
   ## Returns true if the message is a cover traffic packet.
   msg.codec == CoverTrafficCodec
 
+type
+  MixHopDialOutcome* {.pure.} = enum
+    Succeeded
+    Failed
+    Cancelled
+
+  MixHopDialHandler* = proc(
+    peerId: PeerId,
+    addresses: seq[MultiAddress],
+    outcome: MixHopDialOutcome,
+    hadConnection: bool,
+    error: ref CatchableError,
+  ) {.gcsafe, raises: [].}
+    ## Called after each dial of a mix hop. `hadConnection` tells whether the
+    ## switch had a connection to the hop before the dial. `error` is the dial
+    ## error of a failed dial and nil for the other outcomes. When the connection
+    ## limit of this node refuses the dial, `error.parent.parent` is a
+    ## `TooManyConnectionsError`. A dial that forwards a packet, or that sends a
+    ## reply, goes to a peer and an address that the packet names, so a remote
+    ## sender selected them. Compare `addresses` with the hop address of the pool
+    ## before a failure counts against the hop.
+
 ## Mix Protocol defines a decentralized anonymous message routing layer for libp2p networks.
 ## It enables sender anonymity by routing each message through a decentralized mix overlay
 ## network composed of participating libp2p nodes, known as mix nodes. Each message is
@@ -43,6 +65,8 @@ func isCoverTraffic*(msg: MixMessage): bool =
 type MixProtocol* = ref object of LPProtocol
   mixNodeInfo: MixNodeInfo
   switch*: Switch
+  onHopDial*: MixHopDialHandler
+    ## Reports the outcome of each hop dial. A nil handler reports nothing.
   nodePool*: MixNodePool
   tagManager: TagManager
   exitLayer: ExitLayer
@@ -100,6 +124,17 @@ proc removeClosedConnections(
     if mixProto.connPool.pop(p, conn):
       await conn.close()
 
+proc reportHopDial(
+    mixProto: MixProtocol,
+    pid: PeerId,
+    addrs: seq[MultiAddress],
+    outcome: MixHopDialOutcome,
+    hadConnection: bool,
+    error: ref CatchableError = nil,
+) =
+  if not mixProto.onHopDial.isNil:
+    mixProto.onHopDial(pid, addrs, outcome, hadConnection, error)
+
 proc getConn(
     mixProto: MixProtocol,
     pid: PeerId,
@@ -110,12 +145,21 @@ proc getConn(
   if forceNewStream:
     # GC all expired connections including the one used for `pid`
     await mixProto.removeClosedConnections(pid)
-  try:
-    return mixProto.connPool[pid]
-  except KeyError:
-    let c = await mixProto.switch.dial(pid, addrs, codecs)
-    mixProto.connPool[pid] = c
-    return c
+  mixProto.connPool.withValue(pid, conn):
+    return conn[]
+  let hadConnection = mixProto.switch.isConnected(pid)
+  let c =
+    try:
+      await mixProto.switch.dial(pid, addrs, codecs)
+    except DialFailedError as exc:
+      mixProto.reportHopDial(pid, addrs, MixHopDialOutcome.Failed, hadConnection, exc)
+      raise exc
+    except CancelledError as exc:
+      mixProto.reportHopDial(pid, addrs, MixHopDialOutcome.Cancelled, hadConnection)
+      raise exc
+  mixProto.reportHopDial(pid, addrs, MixHopDialOutcome.Succeeded, hadConnection)
+  mixProto.connPool[pid] = c
+  return c
 
 proc writeLp(
     mixProto: MixProtocol,
