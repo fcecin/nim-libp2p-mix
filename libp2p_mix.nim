@@ -14,6 +14,7 @@ export MixProtocolID
 export MixProtocol
 export MixHopDialOutcome
 export MixHopDialHandler
+export MixReplyHopPicker
 
 export get
 export `new`

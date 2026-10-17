@@ -369,6 +369,7 @@ type FakePool = ref object of MixNodePool
   ## peer store.
   members: Table[PeerId, MixPubInfo]
   getCalls: int
+  got: seq[PeerId] ## The peers that `get` was asked for, in order.
 
 method add(pool: FakePool, info: MixPubInfo) {.gcsafe, raises: [].} =
   pool.members[info.peerId] = info
@@ -380,6 +381,7 @@ method remove(pool: FakePool, peerId: PeerId): bool {.gcsafe, raises: [].} =
 
 method get(pool: FakePool, peerId: PeerId): Opt[MixPubInfo] {.gcsafe, raises: [].} =
   inc pool.getCalls
+  pool.got.add(peerId)
   pool.members.withValue(peerId, info):
     return Opt.some(info[])
   Opt.none(MixPubInfo)
@@ -434,6 +436,41 @@ suite "MixNodePool subclass":
       peerStore[MixPubKeyBook][pubInfo.peerId] == pubInfo.mixPubKey
       MixNodePool(pool).get(pubInfo.peerId) == Opt.some(pubInfo)
       MixNodePool(pool).len == 1
+
+  test "a reply hop picker chooses the last reply hop from the candidates":
+    let infos = MixNodeInfo.generateRandomMany(6, rng())
+    let node = MixProtocol.new(
+      infos[0], createSwitch(infos[0].multiAddr, Opt.some(infos[0].libp2pPrivKey))
+    )
+    let pool = FakePool()
+    node.nodePool = pool
+    for info in infos[1 .. ^1]:
+      node.nodePool.add(info.toMixPubInfo())
+    let exitPeerId = infos[1].peerId
+    let destPeerId = infos[2].peerId
+    let chosen = infos[3].peerId
+    var candidates: seq[PeerId]
+    node.replyHopPicker = proc(
+        offered: seq[PeerId]
+    ): Result[PeerId, string] {.gcsafe, raises: [].} =
+      candidates = offered
+      ok(chosen)
+    var id: SURBIdentifier
+    rng().generate(id)
+    # The random draws could end on the chosen hop by chance, so 10 builds.
+    for _ in 0 ..< 10:
+      pool.got.setLen(0)
+      check node.buildSurb(id, destPeerId, exitPeerId).isOk
+      check pool.got[^1] == chosen
+    check:
+      candidates.len == 3
+      exitPeerId notin candidates
+      destPeerId notin candidates
+    node.replyHopPicker = proc(
+        offered: seq[PeerId]
+    ): Result[PeerId, string] {.gcsafe, raises: [].} =
+      err("no connected candidate")
+    check node.buildSurb(id, destPeerId, exitPeerId).error == "no connected candidate"
 
   test "buildSurb reads its hops from a subclass pool":
     let infos = MixNodeInfo.generateRandomMany(5, rng())
