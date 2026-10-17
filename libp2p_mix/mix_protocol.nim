@@ -57,6 +57,13 @@ type
     ## sender selected them. Compare `addresses` with the hop address of the pool
     ## before a failure counts against the hop.
 
+  MixReplyHopPicker* =
+    proc(candidates: seq[PeerId]): Result[PeerId, string] {.gcsafe, raises: [].}
+    ## Chooses the last hop of a reply path, the hop before this node, from the
+    ## candidates. The candidates are the pool members that `get` accepts,
+    ## without the exit and the destination of the request. An error fails the
+    ## reply path.
+
 ## Mix Protocol defines a decentralized anonymous message routing layer for libp2p networks.
 ## It enables sender anonymity by routing each message through a decentralized mix overlay
 ## network composed of participating libp2p nodes, known as mix nodes. Each message is
@@ -67,6 +74,10 @@ type MixProtocol* = ref object of LPProtocol
   switch*: Switch
   onHopDial*: MixHopDialHandler
     ## Reports the outcome of each hop dial. A nil handler reports nothing.
+  replyHopPicker*: MixReplyHopPicker
+    ## Chooses the last hop of each reply path. A nil picker draws it at random
+    ## like the other hops. With a picker, the other hops of a reply path also
+    ## come only from the members that `get` accepts.
   nodePool*: MixNodePool
   tagManager: TagManager
   exitLayer: ExitLayer
@@ -577,14 +588,33 @@ method buildSurb*(
     mixProto.nodePool.peerIds().filterIt(it != exitPeerId and it != destPeerId)
   var availableIndices = toSeq(0 ..< poolPeerIds.len)
 
+  # The picker chooses the last reply hop before the random draws, so a draw
+  # cannot take the hop that it prefers.
+  var lastHopIndex = Opt.none(int)
+  if not mixProto.replyHopPicker.isNil:
+    # With a picker, each reply hop comes from the members that `get` accepts.
+    poolPeerIds = poolPeerIds.filterIt(mixProto.nodePool.get(it).isSome)
+    availableIndices = toSeq(0 ..< poolPeerIds.len)
+    let picked = ?mixProto.replyHopPicker(poolPeerIds)
+    let index = poolPeerIds.find(picked)
+    if index == -1:
+      return err("the reply hop picker chose a peer that is not a candidate")
+    lastHopIndex = Opt.some(index)
+    availableIndices.del(availableIndices.find(index))
+
   # Select L mix nodes at random
   for i in 0 ..< PathLength:
     let (peerId, multiAddr, mixPubKey, hopDelay) =
       if i < PathLength - 1:
-        let selectedIndex = mixProto.rng.pickOne(availableIndices).valueOr:
-          return err("No. of public mix nodes less than path length")
+        let selectedIndex =
+          if i == PathLength - 2 and lastHopIndex.isSome:
+            lastHopIndex.get()
+          else:
+            let drawn = mixProto.rng.pickOne(availableIndices).valueOr:
+              return err("No. of public mix nodes less than path length")
+            availableIndices.del(availableIndices.find(drawn))
+            drawn
         let randPeerId = poolPeerIds[selectedIndex]
-        availableIndices.del(availableIndices.find(selectedIndex))
         debug "Selected mix node for surbs: ", indexInPath = i, peerId = randPeerId
         let mixPubInfo = mixProto.nodePool.get(randPeerId).valueOr:
           return err("could not get mix pub info for peer: " & $randPeerId)
