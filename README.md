@@ -82,15 +82,20 @@ let mixNodeInfo = initMixNodeInfo(
   peerId, multiAddr, mixPubKey, mixPrivKey, libp2pPubKey, libp2pPrivKey
 )
 
-let mix = MixProtocol.new(mixNodeInfo, switch).valueOr:
-  return err("mix init failed: " & error)
+# Mix routes through a MixPool. MixNodePool is the stock one, on the switch
+# peer store. Keep the pool to add nodes to it.
+let pool = MixNodePool.new(switch.peerStore, newRng())
+let mix = MixProtocol.new(mixNodeInfo, switch, pool = pool)
 
 # Optional: configure how the exit layer reads payloads for a given proto
 mix.registerDestReadBehavior("/your/proto/1.0.0", readLp(maxSize = -1))
 
-# Optional: bootstrap the node pool
+# Optional: add known mix nodes
 for bootstrapNode in bootstrapNodes:
-  mix.nodePool.add(bootstrapNode)
+  pool.add(bootstrapNode)
+
+# A host that keeps its own peers passes an ExternalMixPool instead. It answers
+# the three requests in libp2p_mix/external_pool.nim on the pool's context.
 
 # Mount and start
 switch.mount(mix)

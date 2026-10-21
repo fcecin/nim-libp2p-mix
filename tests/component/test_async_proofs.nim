@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0 OR MIT
 {.used.}
+
 import chronos, results, metrics
 import libp2p/switch
 import libp2p/stream/connection
@@ -7,7 +8,7 @@ import libp2p_mix
 import
   libp2p_mix/[mix_protocol, spam_protection, cover_traffic, mix_metrics, delay_strategy]
 import ../utils
-import ../tools/[unittest, lifecycle, crypto]
+import ../tools/[unittest, lifecycle, crypto, host_pool]
 
 type AsyncProofs = ref object of SpamProtection
   generated, verified: int
@@ -72,12 +73,13 @@ suite "Asynchronous proof provider":
     let node = MixProtocol.new(
       infos[0],
       sw,
+      pool = newHostPool(),
       spamProtection = Opt.some(SpamProtection(provider)),
       delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
       coverTraffic = Opt.some(CoverTraffic(ct)),
     )
     for info in infos[1 .. ^1]:
-      node.nodePool.add(info.toMixPubInfo())
+      node.pool.addPeer(info.toMixPubInfo())
 
     var sent = 0
     ct.setCoverPacketSender(
@@ -147,12 +149,13 @@ suite "Asynchronous proof provider":
     let node = MixProtocol.new(
       infos[0],
       sw,
+      pool = newHostPool(),
       spamProtection = Opt.some(SpamProtection(provider)),
       delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
       coverTraffic = Opt.some(CoverTraffic(ct)),
     )
     for info in infos[1 .. ^1]:
-      node.nodePool.add(info.toMixPubInfo())
+      node.pool.addPeer(info.toMixPubInfo())
 
     var sentPacket: seq[byte]
     ct.setCoverPacketSender(
@@ -182,12 +185,13 @@ suite "Asynchronous proof provider":
       let node = MixProtocol.new(
         info,
         sw,
+        pool = newHostPool(),
         spamProtection = Opt.some(SpamProtection(provider)),
         delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
       )
       for other in infos:
         if other.peerId != info.peerId:
-          node.nodePool.add(other.toMixPubInfo())
+          node.pool.addPeer(other.toMixPubInfo())
       sw.mount(node)
       nodes.add(node)
       providers.add(provider)
