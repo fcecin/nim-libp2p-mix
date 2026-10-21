@@ -15,7 +15,7 @@ import libp2p_mix/spam_protection
 
 import metrics
 import libp2p_mix/mix_metrics
-import ../tools/[lifecycle, unittest, crypto]
+import ../tools/[lifecycle, unittest, crypto, peer_source]
 import ../[utils, spam_protection_impl]
 
 suite "Cover Traffic - Integration":
@@ -151,6 +151,7 @@ suite "Cover Traffic - Integration":
     discard MixProtocol.new(
       mixNodeInfo,
       switch,
+      brokerCtx = hostPeerContext(),
       spamProtection = Opt.some(SpamProtection(sp)),
       delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
       coverTraffic = Opt.some(CoverTraffic(ct)),

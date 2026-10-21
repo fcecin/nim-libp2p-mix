@@ -11,7 +11,7 @@ import libp2p/protocols/protocol
 import libp2p/stream/connection
 import libp2p_mix
 import libp2p_mix/[mix_protocol, cover_traffic]
-import ../tools/[crypto, unittest]
+import ../tools/[crypto, unittest, peer_source]
 
 type
   Counter = ref object
@@ -82,7 +82,8 @@ proc defaultExitDelivery() {.async.} =
         Opt.some(CoverTraffic(cover))
       else:
         Opt.none(CoverTraffic)
-    let proto = MixProtocol.new(infos[i], sw, coverTraffic = ct)
+    let proto =
+      MixProtocol.new(infos[i], sw, coverTraffic = ct, brokerCtx = hostPeerContext())
     sw.mount(proto)
     if i == 4:
       sw.mount(receiver(local))
@@ -103,7 +104,7 @@ proc defaultExitDelivery() {.async.} =
     for j in 0 ..< infos.len:
       if i == j:
         continue
-      protos[i].nodePool.add(infos[j].toMixPubInfo())
+      protos[i].brokerCtx.add(infos[j].toMixPubInfo()).get()
 
   let localDest = MixDestination.exitNode(infos[4].peerId)
   let externalDest =

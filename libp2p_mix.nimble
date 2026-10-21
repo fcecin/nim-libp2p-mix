@@ -12,6 +12,8 @@ requires "nim >= 2.2.4",
   "libp2p >= 2.2.1", "chronicles >= 0.11.0", "chronos >= 4.2.2", "metrics",
   "nimcrypto >= 0.6.0", "stew >= 0.4.2", "results", "unittest2"
 
+requires "https://github.com/NagyZoltanPeter/nim-brokers.git#fd97eb355eee5d14594e0b4599964eff00648ec7"
+
 import os, strutils
 
 let nimc = getEnv("NIMC", "nim") # Which nim compiler to use

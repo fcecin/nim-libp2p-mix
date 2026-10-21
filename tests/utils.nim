@@ -12,7 +12,7 @@ import libp2p_mix/mix_protocol
 import libp2p_mix/curve25519
 import libp2p_mix/delay_strategy
 
-import ./tools/[unittest, crypto]
+import ./tools/[unittest, crypto, lifecycle, peer_source]
 import ./[mock_mix, spam_protection_impl]
 
 proc createSwitch*(
@@ -57,6 +57,7 @@ proc setupMixNode[T: MixProtocol](
     switch,
     spamProtection = spamProtection,
     delayStrategy = Opt.some(actualDelayStrategy),
+    brokerCtx = hostPeerContext(),
   )
 
   if destReadBehavior.isSome():
@@ -80,7 +81,7 @@ proc setupMixNodes*(
     let mixNode = setupMixNode[MixProtocol](
       mixNodeInfo, switch, destReadBehavior, spamProtectionRateLimit, delayStrategy
     )
-    mixNode.nodePool.add(nodeInfos.includeAllExcept(mixNodeInfo))
+    mixNode.brokerCtx.add(nodeInfos.includeAllExcept(mixNodeInfo)).get()
     nodes.add(mixNode)
 
   nodes
@@ -101,7 +102,7 @@ proc setupMixNodesWithMock*(
   let mock = setupMixNode[MockMixProtocol](
     mockMixNodeInfo, mockSwitch, destReadBehavior, Opt.none(int)
   )
-  mock.nodePool.add(nodeInfos.includeAllExcept(mockMixNodeInfo))
+  mock.brokerCtx.add(nodeInfos.includeAllExcept(mockMixNodeInfo)).get()
   nodes.add(mock)
 
   for index in 1 ..< numNodes:
@@ -110,7 +111,7 @@ proc setupMixNodesWithMock*(
       createSwitch(mixNodeInfo.multiAddr, Opt.some(mixNodeInfo.libp2pPrivKey))
     let mixNode =
       setupMixNode[MixProtocol](mixNodeInfo, switch, destReadBehavior, Opt.none(int))
-    mixNode.nodePool.add(nodeInfos.includeAllExcept(mixNodeInfo))
+    mixNode.brokerCtx.add(nodeInfos.includeAllExcept(mixNodeInfo)).get()
     nodes.add(mixNode)
 
   (nodes, mock)
@@ -234,3 +235,39 @@ method generateForEntry*(self: FixedDelayStrategy): Delay =
 
 method generateForIntermediate*(self: FixedDelayStrategy, encodedDelay: Delay): Delay =
   self.delay
+
+proc startTestMixNodes*(
+    count: int, useHostStore = true
+): Future[seq[MixProtocol]] {.async.} =
+  ## Start test nodes on OS-assigned ports and store each node with the others.
+  ## Each node gets providers backed by a host store when `useHostStore` is true,
+  ## or by `MixNodePool` when it is false.
+  var nodes: seq[MixProtocol]
+  for _ in 0 ..< count:
+    let info = MixNodeInfo.generateRandom(0, rng())
+    let sw = createSwitch(info.multiAddr, Opt.some(info.libp2pPrivKey))
+    let selectedCtx: BrokerContext =
+      if useHostStore:
+        hostPeerContext()
+      else:
+        poolPeerContext(sw.peerStore)
+    let proto = MixProtocol.new(
+      info,
+      sw,
+      brokerCtx = selectedCtx,
+      delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
+    )
+    sw.mount(proto)
+    nodes.add(proto)
+  try:
+    await startNodes(nodes)
+  except CatchableError as e:
+    await stopNodes(nodes)
+    raise e
+  for node in nodes:
+    node.setLocalMultiAddr(node.switch.peerInfo.addrs[0]).expect("bound address")
+  for node in nodes:
+    for other in nodes:
+      if other != node:
+        node.brokerCtx.add(other.localMixPubInfo()).get()
+  nodes

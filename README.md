@@ -82,15 +82,24 @@ let mixNodeInfo = initMixNodeInfo(
   peerId, multiAddr, mixPubKey, mixPrivKey, libp2pPubKey, libp2pPrivKey
 )
 
-let mix = MixProtocol.new(mixNodeInfo, switch).valueOr:
-  return err("mix init failed: " & error)
+# Peer storage and the last reply hop come from broker providers. The first
+# call registers storage providers backed by the switch peer store. The second
+# registers the standalone random reply selection.
+let ctx = NewBrokerContext()
+registerMixPeerProviders(ctx, switch.peerStore).isOkOr:
+  return err("mix peer providers failed: " & error)
+registerRandomReplySelection(ctx, newRng()).isOkOr:
+  return err("mix reply selection failed: " & error)
+
+let mix = MixProtocol.new(mixNodeInfo, switch, brokerCtx = ctx)
 
 # Optional: configure how the exit layer reads payloads for a given proto
 mix.registerDestReadBehavior("/your/proto/1.0.0", readLp(maxSize = -1))
 
-# Optional: bootstrap the node pool
+# Optional: add known mix nodes through the registered providers
 for bootstrapNode in bootstrapNodes:
-  mix.nodePool.add(bootstrapNode)
+  mix.brokerCtx.add(bootstrapNode).isOkOr:
+    return err("could not store a mix node: " & error)
 
 # Mount and start
 switch.mount(mix)
