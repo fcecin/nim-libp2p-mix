@@ -48,6 +48,9 @@ type PeerStreamLock = ref object
 type MixProtocol* = ref object of LPProtocol
   mixNodeInfo: MixNodeInfo
   switch*: Switch
+  stopping: bool
+  ongoingLocalSends: seq[FutureBase]
+    ## Tracks in-flight local sends so stop can cancel and await them.
   pool*: MixPool ## The peers this node routes through. See mix_pool.nim.
   tagManager: TagManager
   exitLayer: ExitLayer
@@ -111,6 +114,8 @@ proc getConn(
     codecs: seq[string],
     failed: Connection = nil,
 ): Future[Connection] {.async: (raises: [DialFailedError, CancelledError]).} =
+  if mixProto.stopping:
+    raise newException(CancelledError, "mix protocol has stopped")
   var streamLock = mixProto.streamLocks.getOrDefault(pid)
   if streamLock.isNil:
     streamLock = PeerStreamLock(lock: newAsyncLock())
@@ -123,11 +128,16 @@ proc getConn(
         streamLock.lock.release()
       except AsyncLockError as exc:
         raiseAssert "stream lock released without acquire: " & exc.msg
+    if mixProto.stopping:
+      raise newException(CancelledError, "mix protocol has stopped")
     if not failed.isNil:
       await mixProto.removeClosedConnections(failed)
     mixProto.connPool.withValue(pid, conn):
       return conn[]
     let c = await mixProto.switch.dial(pid, addrs, codecs)
+    if mixProto.stopping:
+      await noCancel c.close()
+      raise newException(CancelledError, "mix protocol has stopped")
     mixProto.connPool[pid] = c
     return c
   finally:
@@ -760,7 +770,7 @@ proc forwardToAddr*(T: typedesc[MixDestination], p: PeerId, address: MultiAddres
 proc init*(T: typedesc[MixDestination], p: PeerId, address: MultiAddress): T =
   MixDestination.forwardToAddr(p, address)
 
-proc anonymizeLocalProtocolSend*(
+proc sendLocal(
     mixProto: MixProtocol,
     incoming: AsyncQueue[seq[byte]],
     msg: sink seq[byte],
@@ -773,6 +783,8 @@ proc anonymizeLocalProtocolSend*(
   ## On success returns a handle to the reply credentials registered for this
   ## send (or `Opt.none` when `numSurbs == 0`), so the caller can release them
   ## promptly when its connection closes.
+  if mixProto.stopping:
+    return err("mix protocol has stopped")
   when not defined(libp2p_mix_experimental_exit_is_dest):
     doAssert destination.kind == ForwardAddr, "Only exit != destination is allowed"
 
@@ -888,6 +900,41 @@ proc anonymizeLocalProtocolSend*(
 
   sent = true
   return ok(session)
+
+proc anonymizeLocalProtocolSend*(
+    mixProto: MixProtocol,
+    incoming: AsyncQueue[seq[byte]],
+    msg: sink seq[byte],
+    codec: string,
+    destination: MixDestination,
+    numSurbs: uint8,
+): Future[Result[Opt[SurbSession], string]] {.
+    async: (raises: [CancelledError, LPStreamError])
+.} =
+  ## On success returns a handle to the reply credentials registered for this
+  ## send (or `Opt.none` when `numSurbs == 0`), so the caller can release them
+  ## promptly when its connection closes. Protocol stop ends the send with an error.
+  let pending = mixProto.sendLocal(incoming, move(msg), codec, destination, numSurbs)
+  if not pending.finished:
+    mixProto.ongoingLocalSends.add(FutureBase(pending))
+    pending.addCallback(
+      proc(_: pointer) {.gcsafe, raises: [].} =
+        mixProto.ongoingLocalSends.keepItIf(not it.finished)
+    )
+  try:
+    await pending.join()
+    if pending.cancelled:
+      return err("mix protocol has stopped")
+    return await pending
+  except CancelledError as exc:
+    # The send can complete in the same scheduler step that cancels this
+    # caller. Nobody receives the handle then, so release the credentials here.
+    if pending.completed():
+      pending.value().withValue(session):
+        session.get(nil).release()
+    raise exc
+  finally:
+    await noCancel pending.cancelAndWait()
 
 proc sendSurbReply*(
     mixProto: MixProtocol, surb: SURB, msg: sink seq[byte]
@@ -1023,28 +1070,33 @@ proc sendCoverPacket*(
   return await mixProto.writeCoverPacket(peerId, multiAddr, proved)
 
 method start*(mixProto: MixProtocol) {.async: (raises: [CancelledError]).} =
+  mixProto.stopping = false
   await procCall LPProtocol(mixProto).start()
+  mixProto.tagManager.start()
+  mixProto.surbStore.start()
   mixProto.coverTraffic.withValue(ct):
     await ct.start()
 
 method stop*(mixProto: MixProtocol) {.async: (raises: []).} =
-  ## Stop the MixProtocol background tasks and cancel all in-flight
-  ## handleMixMessages futures.
+  ## Cancel the pending sends and handlers, close the cached hop streams, then
+  ## stop the stores.
+  mixProto.stopping = true
   mixProto.started = false
-
-  await mixProto.tagManager.stop()
-
-  await mixProto.surbStore.stop()
-  mixProto.surbStore.clear()
-
   mixProto.coverTraffic.withValue(ct):
     await ct.stop()
-
-  # Snapshot the list and clear it before cancelling.
-  let pending = mixProto.ongoingMixMessages
+  let pending =
+    mixProto.ongoingLocalSends & mixProto.ongoingMixMessages.mapIt(FutureBase(it))
+  mixProto.ongoingLocalSends = @[]
   mixProto.ongoingMixMessages = @[]
   if pending.len > 0:
     await noCancel allFutures(pending.mapIt(it.cancelAndWait()))
+  let streams = mixProto.connPool.values.toSeq()
+  mixProto.connPool.clear()
+  if streams.len > 0:
+    await noCancel allFutures(streams.mapIt(it.close()))
+  await mixProto.tagManager.stop()
+  await mixProto.surbStore.stop()
+  mixProto.surbStore.clear()
 
 proc init*(
     mixProto: MixProtocol,

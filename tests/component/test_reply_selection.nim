@@ -216,6 +216,12 @@ suite "Pool selection of the final reply peer":
   asyncTest "cancellation releases a partially built reply group":
     await interruptedSelection("cancel")
 
+  asyncTest "entry close cancels reply selection and releases the group":
+    await interruptedSelection("close")
+
+  asyncTest "protocol stop cancels reply selection and releases the group":
+    await interruptedSelection("stop")
+
   asyncTest "a pool error fails a send without a defect or retained credentials":
     for failing in ["list", "read", "reply"]:
       let mix = await selectorNode("error")
