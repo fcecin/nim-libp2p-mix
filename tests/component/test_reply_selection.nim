@@ -195,6 +195,12 @@ suite "Host selection of the final reply peer":
   asyncTest "cancellation releases a partially built reply group":
     await interruptedSelection("cancel")
 
+  asyncTest "entry close cancels host preparation and releases the group":
+    await interruptedSelection("close")
+
+  asyncTest "protocol stop cancels host preparation and releases the group":
+    await interruptedSelection("stop")
+
   asyncTest "missing providers fail a send without a defect or retained credentials":
     for missing in ["list", "read", "reply"]:
       let mix = await selectorNode("error")
