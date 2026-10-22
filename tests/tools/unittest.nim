@@ -3,6 +3,7 @@
 
 import chronos, unittest2, macros
 import ./trackers
+import ./peer_source
 
 export checkTrackers # TODO: maybe consider importing it on demand?
 export unittest2 except suite
@@ -12,6 +13,8 @@ export unittest2 except suite
 template suite*(name: string, body: untyped): untyped =
   block:
     proc testSuite() =
+      defer:
+        clearHostPeerProviders()
       unittest2.suite name:
         body
 

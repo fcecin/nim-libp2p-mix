@@ -47,10 +47,16 @@ proc mixPingSimulation() {.async: (raises: [Exception]).} =
   # Set up mix protocols on each mix node
   for nodeInfo in mixNodeInfos:
     var switch = createSwitch(nodeInfo.multiAddr, rng, Opt.some(nodeInfo.libp2pPrivKey))
-    let proto = MixProtocol.new(nodeInfo, switch)
+    let ctx = NewBrokerContext()
+    registerMixPeerProviders(ctx, switch.peerStore).isOkOr:
+      raise newException(ValueError, error)
+    registerRandomReplySelection(ctx, rng).isOkOr:
+      raise newException(ValueError, error)
+    let proto = MixProtocol.new(nodeInfo, switch, brokerCtx = ctx)
 
-    # Populate nodePool with all other nodes' public info
-    proto.nodePool.add(mixNodeInfos.includeAllExcept(nodeInfo))
+    # Add all other nodes through the registered providers
+    proto.brokerCtx.add(mixNodeInfos.includeAllExcept(nodeInfo)).isOkOr:
+      raise newException(ValueError, error)
 
     # Register how to read ping responses (32 bytes exactly)
     proto.registerDestReadBehavior(PingCodec, readExactly(32))
@@ -61,6 +67,8 @@ proc mixPingSimulation() {.async: (raises: [Exception]).} =
 
   defer:
     await switches.mapIt(it.stop()).allFutures()
+    for proto in mixProtos:
+      clearMixProviders(proto.brokerCtx)
 
   # Create a destination node (not part of the mix network)
   let destNode = createSwitch(MultiAddress.init("/ip4/0.0.0.0/tcp/0").tryGet(), rng)

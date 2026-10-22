@@ -4,7 +4,7 @@
 import
   ./libp2p_mix/[
     mix_protocol, mix_node, entry_connection, exit_layer, spam_protection,
-    delay_strategy, pool,
+    delay_strategy, pool, peer_selection, pool_providers,
   ]
 import libp2p/stream/connection
 import chronos
@@ -23,6 +23,7 @@ export destReadBehaviorCb
 export DestReadBehavior
 export registerDestReadBehavior
 export localMixPubInfo
+export selectReplyPeer
 export setLocalMultiAddr
 export buildCoverPacket
 export sendCoverPacket
@@ -43,6 +44,11 @@ export MixNodePool
 export add
 export remove
 export peerIds
+export peer_requests
+export registerMixPeerProviders
+export registerRandomReplySelection
+export count
+export selectRandomNodes
 
 proc readLp*(maxSize: int): DestReadBehavior =
   ## Create a read behavior that reads length-prefixed messages (varint-encoded length).
