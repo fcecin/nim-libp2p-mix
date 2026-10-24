@@ -9,6 +9,7 @@ import libp2p_mix
 import libp2p_mix/mix_node
 import libp2p_mix/mix_protocol
 import libp2p_mix/pool
+import ./tools/host_pool
 import libp2p_mix/serialization
 
 type MockMixProtocol* = ref object of MixProtocol
@@ -35,11 +36,15 @@ type MockMixProtocol* = ref object of MixProtocol
   receivedPacketCount*: int
 
 method buildSurb*(
-    mock: MockMixProtocol, id: SURBIdentifier, destPeerId: PeerId, exitPeerId: PeerId
+    mock: MockMixProtocol,
+    id: SURBIdentifier,
+    destPeerId: PeerId,
+    exitPeerId: PeerId,
+    finalPeer: Opt[PeerId] = Opt.none(PeerId),
 ): Result[SURB, string] {.gcsafe, raises: [].} =
   # No forced paths configured or all sets consumed — fall back to random selection
   if mock.surbPeerSets.len == 0 or mock.surbCallIndex >= mock.surbPeerSets.len:
-    return procCall buildSurb(MixProtocol(mock), id, destPeerId, exitPeerId)
+    return procCall buildSurb(MixProtocol(mock), id, destPeerId, exitPeerId, finalPeer)
 
   # The exit node is randomly chosen during forward path construction, so it
   # might be one of our candidates. Remove it.
@@ -52,15 +57,17 @@ method buildSurb*(
   let keepInPool = (peers & exitPeerId).toHashSet()
 
   var removed: seq[MixPubInfo]
-  for peerId in mock.nodePool.peerIds():
+  for peerId in mock.pool.listPeerIds().get():
     if peerId notin keepInPool:
-      removed.add(mock.nodePool.get(peerId).get())
-      discard mock.nodePool.remove(peerId)
+      removed.add(mock.pool.usablePeer(peerId).get().get())
+      discard mock.pool.removePeer(peerId)
 
-  let surb = procCall buildSurb(MixProtocol(mock), id, destPeerId, exitPeerId)
+  let surb = procCall buildSurb(
+    MixProtocol(mock), id, destPeerId, exitPeerId, Opt.some(peers[^1])
+  )
 
   for info in removed:
-    mock.nodePool.add(info)
+    mock.pool.addPeer(info)
 
   mock.actualSurbPeers.add(peers)
   mock.surbCallIndex.inc

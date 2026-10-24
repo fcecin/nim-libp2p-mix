@@ -10,7 +10,7 @@ import
     mix_protocol, mix_node, sphinx, serialization, multiaddr, tag_manager, curve25519,
     delay_strategy,
   ]
-import ./tools/[unittest, crypto, lifecycle]
+import ./tools/[unittest, crypto, lifecycle, host_pool]
 import ./utils
 
 proc privKeyFor(infos: seq[MixNodeInfo], peerId: PeerId): FieldElement =
@@ -31,20 +31,24 @@ proc setupNodesWithInfos(
     let proto = MixProtocol.new(
       info,
       switch,
+      pool = newHostPool(),
       delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
     )
-    proto.nodePool.add(infos.includeAllExcept(info))
+    proto.pool.addPeers(infos.includeAllExcept(info))
     switch.mount(proto)
     nodes.add(proto)
   (nodes, infos)
 
 proc replacePool(mix: MixProtocol, keep: seq[MixPubInfo]) =
-  for peerId in mix.nodePool.peerIds():
-    discard mix.nodePool.remove(peerId)
-  mix.nodePool.add(keep)
+  for peerId in mix.pool.listPeerIds().get():
+    discard mix.pool.removePeer(peerId)
+  mix.pool.addPeers(keep)
 
 proc selfMultiAddrFromPath(
-    packetBytes: seq[byte], firstHopPeerId: PeerId, infos: seq[MixNodeInfo]
+    packetBytes: seq[byte],
+    firstHopPeerId: PeerId,
+    infos: seq[MixNodeInfo],
+    expectedFinal: Opt[PeerId] = Opt.none(PeerId),
 ): MultiAddress =
   ## Peel PathLength-1 intermediate hops. The penultimate hop's nextHop is the
   ## self/originator multiaddr embedded when the packet was built.
@@ -62,6 +66,8 @@ proc selfMultiAddrFromPath(
     let (nextPeerId, nextMa) =
       bytesToMultiAddr(processed.nextHop.get()).expect("decode next hop")
     if hopIdx == PathLength - 2:
+      doAssert expectedFinal.isNone() or currentPeerId == expectedFinal.get(),
+        "the final peer was not encoded"
       return nextMa
     currentPeerId = nextPeerId
     packet = SphinxPacket.deserialize(processed.serializedSphinxPacket).expect(
@@ -93,14 +99,20 @@ suite "setLocalMultiAddr":
       mix, @[infos[3].toMixPubInfo(), infos[4].toMixPubInfo(), exitInfo.toMixPubInfo()]
     )
 
+    check mix.switch.connectedPeers().len == 0
+
     var id: SURBIdentifier
     rng().generate(id)
-    let surb = mix.buildSurb(id, destInfo.peerId, exitInfo.peerId).expect("build SURB")
+    let surb = mix
+      .buildSurb(id, destInfo.peerId, exitInfo.peerId, Opt.some(infos[4].peerId))
+      .expect("build SURB")
 
     let firstHopPeerId =
       bytesToMultiAddr(surb.hop.get()).expect("decode SURB first hop")[0]
     let packetBytes = useSURB(surb, newSeq[byte](MessageSize)).serialize()
-    let selfMa = selfMultiAddrFromPath(packetBytes, firstHopPeerId, infos)
+    let selfMa = selfMultiAddrFromPath(
+      packetBytes, firstHopPeerId, infos, Opt.some(infos[4].peerId)
+    )
 
     check selfMa == updated
 
