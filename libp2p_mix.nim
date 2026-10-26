@@ -4,7 +4,7 @@
 import
   ./libp2p_mix/[
     mix_protocol, mix_node, entry_connection, exit_layer, spam_protection,
-    delay_strategy, pool,
+    delay_strategy, pool, mix_pool,
   ]
 import libp2p/stream/connection
 import chronos
@@ -43,6 +43,10 @@ export MixNodePool
 export add
 export remove
 export peerIds
+
+# Pool classes.
+export MixPool, MixPeerRecord, readPeer, listPeerIds, usablePeer, countUsable
+export selectRandomNodes, NotEnoughMixNodes
 
 proc readLp*(maxSize: int): DestReadBehavior =
   ## Create a read behavior that reads length-prefixed messages (varint-encoded length).

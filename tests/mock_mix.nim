@@ -9,6 +9,7 @@ import libp2p_mix
 import libp2p_mix/mix_node
 import libp2p_mix/mix_protocol
 import libp2p_mix/pool
+import ./tools/host_pool
 import libp2p_mix/serialization
 
 type MockMixProtocol* = ref object of MixProtocol

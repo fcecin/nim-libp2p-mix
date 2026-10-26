@@ -7,14 +7,14 @@ import
   ./[
     curve25519, delay, padding, mix_message, mix_node, sphinx, serialization,
     tag_manager, mix_metrics, exit_layer, multiaddr, exit_connection, spam_protection,
-    delay_strategy, pool, cover_traffic, surb_store,
+    delay_strategy, mix_pool, pool, cover_traffic, surb_store,
   ]
 import libp2p/protocols/protocol
 import libp2p/stream/[connection, lpstream]
 import libp2p/[switch, multicodec, peerinfo, varint]
 import libp2p/crypto/crypto
 
-export pool
+export mix_pool
 export SurbStore, SurbSession
 
 when defined(enable_mix_benchmarks):
@@ -42,7 +42,7 @@ func isCoverTraffic*(msg: MixMessage): bool =
 type MixProtocol* = ref object of LPProtocol
   mixNodeInfo: MixNodeInfo
   switch*: Switch
-  nodePool*: MixNodePool
+  pool*: MixPool ## The peers this node routes through. See mix_pool.nim.
   tagManager: TagManager
   exitLayer: ExitLayer
   rng: Rng
@@ -83,12 +83,6 @@ proc setLocalMultiAddr*(
 
 proc surbCredsLen*(mixProto: MixProtocol): int =
   mixProto.surbStore.len
-
-proc cryptoRandomInt(rng: Rng, max: int): Result[int, string] =
-  if max == 0:
-    return err("Max cannot be zero.")
-  let res = rng.generate(uint64) mod uint64(max)
-  ok(res.int)
 
 proc removeClosedConnections(
     mixProto: MixProtocol, pid: PeerId
@@ -522,57 +516,38 @@ proc getMaxMessageSizeForCodec*(
     return err("cannot encode messages for this codec")
   return ok(DataSize - totalLen)
 
+func poolErrorLabel(error: string): string =
+  ## The metric label of a failed path selection.
+  if error == NotEnoughMixNodes: "LOW_MIX_POOL" else: "POOL_UNAVAILABLE"
+
+proc selectRandomNodes(
+    mixProto: MixProtocol, count: int, exclude: openArray[PeerId]
+): Result[seq[MixPubInfo], string] =
+  mixProto.pool.selectRandomNodes(count, @[mixProto.mixNodeInfo.peerId] & @exclude)
+
 method buildSurb*(
     mixProto: MixProtocol, id: SURBIdentifier, destPeerId: PeerId, exitPeerId: PeerId
 ): Result[SURB, string] {.base, gcsafe, raises: [].} =
+  var selected = ?mixProto.selectRandomNodes(PathLength - 1, [destPeerId, exitPeerId])
+  selected.add(mixProto.localMixPubInfo())
   var
-    publicKeys: seq[FieldElement] = @[]
-    hops: seq[Hop] = @[]
-    delays: seq[Delay] = @[]
-
-  if mixProto.nodePool.len < PathLength:
-    return err("No. of public mix nodes less than path length")
-
-  # Remove exit and dest node from nodes to consider for surbs
-  var poolPeerIds =
-    mixProto.nodePool.peerIds().filterIt(it != exitPeerId and it != destPeerId)
-  var availableIndices = toSeq(0 ..< poolPeerIds.len)
-
-  # Select L mix nodes at random
-  for i in 0 ..< PathLength:
-    let (peerId, multiAddr, mixPubKey, hopDelay) =
-      if i < PathLength - 1:
-        let randomIndexPosition = cryptoRandomInt(mixProto.rng, availableIndices.len).valueOr:
-          return err("failed to generate random num: " & error)
-        let selectedIndex = availableIndices[randomIndexPosition]
-        let randPeerId = poolPeerIds[selectedIndex]
-        availableIndices.del(randomIndexPosition)
-        debug "Selected mix node for surbs: ", indexInPath = i, peerId = randPeerId
-        let mixPubInfo = mixProto.nodePool.get(randPeerId).valueOr:
-          return err("could not get mix pub info for peer: " & $randPeerId)
-        (
-          mixPubInfo.peerId,
-          mixPubInfo.multiAddr,
-          mixPubInfo.mixPubKey,
-          mixProto.delayStrategy.generateForEntry(),
-        )
-      else:
-        (
-          mixProto.mixNodeInfo.peerId, mixProto.mixNodeInfo.multiAddr,
-          mixProto.mixNodeInfo.mixPubKey, NoDelay,
-        ) # No delay for last hop
-
-    publicKeys.add(mixPubKey)
-
-    let multiAddrBytes = multiAddrToBytes(peerId, multiAddr).valueOr:
+    publicKeys: seq[FieldElement]
+    hops: seq[Hop]
+    delays: seq[Delay]
+  for i, node in selected:
+    let encoded = multiAddrToBytes(node.peerId, node.multiAddr).valueOr:
       mix_messages_error.inc(labelValues = ["Entry/SURB", "INVALID_MIX_INFO"])
-      return err("failed to convert multiaddress to bytes: " & error)
-
-    hops.add(Hop.init(multiAddrBytes))
-
-    delays.add(hopDelay)
-
-  return createSURB(publicKeys, delays, hops, id, mixProto.rng)
+      return err("failed to encode reply hop: " & error)
+    debug "Selected mix node for surbs", indexInPath = i, peerId = node.peerId
+    publicKeys.add(node.mixPubKey)
+    hops.add(Hop.init(encoded))
+    delays.add(
+      if i == selected.high:
+        NoDelay
+      else:
+        mixProto.delayStrategy.generateForEntry()
+    )
+  createSURB(publicKeys, delays, hops, id, mixProto.rng)
 
 proc buildSurbs(
     mixProto: MixProtocol,
@@ -800,84 +775,39 @@ proc anonymizeLocalProtocolSend*(
     delays: seq[Delay] = @[]
     exitPeerId: PeerId
 
-  let numMixNodes = mixProto.nodePool.len
-  var numAvailableNodes = numMixNodes
+  var selected: seq[MixPubInfo]
+  case destination.kind
+  of ForwardAddr:
+    selected = mixProto.selectRandomNodes(PathLength, [destination.peerId]).valueOr:
+      mix_messages_error.inc(labelValues = ["Entry", poolErrorLabel(error)])
+      return err(error)
+    exitPeerId = selected[^1].peerId
+  of MixNode:
+    if destination.peerId == mixProto.mixNodeInfo.peerId:
+      return err("Destination must be a remote mix node")
+    let exit = (?mixProto.pool.usablePeer(destination.peerId)).valueOr:
+      return err("Destination does not support mix")
+    selected = mixProto.selectRandomNodes(PathLength - 1, [destination.peerId]).valueOr:
+      mix_messages_error.inc(labelValues = ["Entry", poolErrorLabel(error)])
+      return err(error)
+    selected.add(exit)
+    exitPeerId = exit.peerId
 
-  debug "Destination data", destination
-
-  if mixProto.nodePool.get(destination.peerId).isSome:
-    numAvailableNodes = numMixNodes - 1
-
-  if numAvailableNodes < PathLength:
-    mix_messages_error.inc(labelValues = ["Entry", "LOW_MIX_POOL"])
-    return err(
-      fmt"No. of public mix nodes ({numAvailableNodes}) less than path length ({PathLength})."
-    )
-
-  var poolPeerIds = mixProto.nodePool.peerIds()
-  var availableIndices = toSeq(0 ..< poolPeerIds.len)
-
-  let index = poolPeerIds.find(destination.peerId)
-  if index != -1:
-    availableIndices.del(index)
-  elif destination.kind == MixNode:
-    return err("Destination does not support mix")
-
-  var nextHopAddr: MultiAddress
-  var nextHopPeerId: PeerId
-  while hop.len < PathLength:
-    if availableIndices.len == 0:
-      mix_messages_error.inc(labelValues = ["Entry", "LOW_MIX_POOL"])
-      return err("Ran out of available mix nodes while constructing path")
-
-    let randomIndexPosition = cryptoRandomInt(mixProto.rng, availableIndices.len).valueOr:
-      mix_messages_error.inc(labelValues = ["Entry", "NON_RECOVERABLE"])
-      return err(fmt"Failed to generate random number: {error}")
-    let selectedIndex = availableIndices[randomIndexPosition]
-    var randPeerId = poolPeerIds[selectedIndex]
-    availableIndices.del(randomIndexPosition)
-
-    if destination.kind == ForwardAddr and randPeerId == destination.peerId:
-      continue
-
-    if hop.len == PathLength - 1:
-      case destination.kind
-      of ForwardAddr:
-        exitPeerId = randPeerId
-      of MixNode:
-        exitPeerId = destination.peerId
-        randPeerId = destination.peerId
-
-    debug "Selected mix node: ", indexInPath = hop.len, peerId = randPeerId
-
-    let mixPubInfo = mixProto.nodePool.get(randPeerId).valueOr:
-      mix_messages_error.inc(labelValues = ["Entry", "INVALID_MIX_INFO"])
-      trace "Failed to get mix pub info for peer, skipping and removing node from pool",
-        peerId = randPeerId
-      discard mixProto.nodePool.remove(randPeerId)
-      continue
-    let (peerId, multiAddr, mixPubKey, _) = mixPubInfo.get()
-
-    let multiAddrBytes = multiAddrToBytes(peerId, multiAddr).valueOr:
-      mix_messages_error.inc(labelValues = ["Entry", "INVALID_MIX_INFO"])
-      trace "Failed to convert multiaddress to bytes, skipping and removing node from pool",
-        error = error, peerId = peerId, multiAddr = multiAddr
-      discard mixProto.nodePool.remove(randPeerId)
-      continue
-
-    publicKeys.add(mixPubKey)
-
-    if hop.len == 0:
-      nextHopAddr = multiAddr
-      nextHopPeerId = peerId
-
+  let nextHopAddr = selected[0].multiAddr
+  let nextHopPeerId = selected[0].peerId
+  for i, node in selected:
+    # usablePeer already checked that each selected address encodes.
+    let encoded = multiAddrToBytes(node.peerId, node.multiAddr).valueOr:
+      return err("failed to encode mix hop: " & error)
+    debug "Selected mix node", indexInPath = i, peerId = node.peerId
+    publicKeys.add(node.mixPubKey)
+    hop.add(Hop.init(encoded))
     delays.add(
-      if hop.len != PathLength - 1:
-        mixProto.delayStrategy.generateForEntry()
-      else:
+      if i == selected.high:
         NoDelay
+      else:
+        mixProto.delayStrategy.generateForEntry()
     )
-    hop.add(Hop.init(multiAddrBytes))
 
   # Encode destination
   let destHop =
@@ -961,45 +891,12 @@ proc sendSurbReply*(
     return err("could not send reply: " & error)
   return ok()
 
-type PathNode = object
-  peerId: PeerId
-  multiAddr: MultiAddress
-  mixPubKey: FieldElement
-
-proc selectRandomNodes(
-    mixProto: MixProtocol, count: int, excludePeerIds: HashSet[PeerId]
-): Result[seq[PathNode], string] {.raises: [].} =
-  let available = mixProto.nodePool.peerIds().filterIt(it notin excludePeerIds)
-  if available.len < count:
-    return err(
-      "Not enough mix nodes in pool (available=" & $available.len & ", needed=" & $count &
-        ")"
-    )
-
-  let selectedPeerIds = mixProto.rng.pick(available, count).valueOr:
-    return err("No mix nodes available in pool")
-
-  var selected: seq[PathNode]
-  for peerId in selectedPeerIds:
-    let mixPubInfo = mixProto.nodePool.get(peerId).valueOr:
-      return err("Could not get mix pub info for peer: " & $peerId)
-    selected.add(
-      PathNode(
-        peerId: mixPubInfo.peerId,
-        multiAddr: mixPubInfo.multiAddr,
-        mixPubKey: mixPubInfo.mixPubKey,
-      )
-    )
-  ok(selected)
-
 proc buildCoverPacket*(
     mixProto: MixProtocol, epoch: uint64
 ): Future[Result[CoverPacketBuild, string]] {.async: (raises: [CancelledError]).} =
   ## Build a cover Sphinx packet with a loop path (self = exit node),
   ## random payload .
-  let nodes = mixProto.selectRandomNodes(
-    PathLength - 1, [mixProto.mixNodeInfo.peerId].toHashSet
-  ).valueOr:
+  let nodes = mixProto.selectRandomNodes(PathLength - 1, []).valueOr:
     return err(error)
 
   var
@@ -1131,6 +1028,7 @@ proc init*(
     delayStrategy: Opt[DelayStrategy] = Opt.none(DelayStrategy),
     coverTraffic: Opt[CoverTraffic] = Opt.none(CoverTraffic),
     surbStore: SurbStore = nil,
+    pool: MixPool = nil,
 ) {.raises: [].} =
   ## Initialize a MixProtocol instance.
   ##
@@ -1138,8 +1036,8 @@ proc init*(
   ## `SurbStore.new()` keeps the constructor out of the parameter list, so
   ## callers do not need `surb_store`'s `new` in scope.
   ##
-  ## Mix node public keys should be populated via the nodePool after
-  ## initialization using `mixProto.nodePool.add(mixPubInfo)`.
+  ## `pool` supplies the peers to route through. A nil `pool` gets a
+  ## `MixNodePool` on the switch's peer store. See mix_pool.nim.
   ##
   ## Default delay strategy is `ExponentialDelayStrategy` (mean 100 ms for both
   ## per-hop encoding and the sender pre-send hold). When `spamProtection` is
@@ -1163,7 +1061,11 @@ proc init*(
   mixProto.mixNodeInfo = mixNodeInfo
   mixProto.switch = switch
   mixProto.rng = switch.rng
-  mixProto.nodePool = MixNodePool.new(switch.peerStore)
+  mixProto.pool =
+    if pool.isNil:
+      MixNodePool.new(switch.peerStore, switch.rng)
+    else:
+      pool
   mixProto.tagManager = tagManager
   mixProto.surbStore = store
   mixProto.destReadBehaviors = newTable[string, DestReadBehavior]()
@@ -1247,11 +1149,12 @@ proc new*(
     delayStrategy: Opt[DelayStrategy] = Opt.none(DelayStrategy),
     coverTraffic: Opt[CoverTraffic] = Opt.none(CoverTraffic),
     surbStore: SurbStore = nil,
+    pool: MixPool = nil,
 ): T {.raises: [].} =
   ## Create a new MixProtocol instance.
   ##
-  ## Mix node public keys should be populated via the nodePool after
-  ## creation using `mixProto.nodePool.add(mixPubInfo)`.
+  ## `pool` supplies the peers to route through. A nil `pool` gets a
+  ## `MixNodePool` on the switch's peer store. See mix_pool.nim.
   ##
   ## When `spamProtection` is enabled, callers should prefer
   ## `SpamProtectionDelayStrategy` to avoid timing correlation between proof
@@ -1259,6 +1162,6 @@ proc new*(
   let mixProto = new(T)
   mixProto.init(
     mixNodeInfo, switch, tagManager, spamProtection, delayStrategy, coverTraffic,
-    surbStore,
+    surbStore, pool,
   )
   mixProto

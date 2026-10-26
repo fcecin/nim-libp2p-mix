@@ -10,7 +10,7 @@ import
     mix_protocol, mix_node, sphinx, serialization, multiaddr, tag_manager, curve25519,
     delay_strategy,
   ]
-import ./tools/[unittest, crypto, lifecycle]
+import ./tools/[unittest, crypto, lifecycle, host_pool]
 import ./utils
 
 proc privKeyFor(infos: seq[MixNodeInfo], peerId: PeerId): FieldElement =
