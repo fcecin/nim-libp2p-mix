@@ -23,6 +23,7 @@ export destReadBehaviorCb
 export DestReadBehavior
 export registerDestReadBehavior
 export localMixPubInfo
+export selectReplyPeer
 export setLocalMultiAddr
 export buildCoverPacket
 export sendCoverPacket

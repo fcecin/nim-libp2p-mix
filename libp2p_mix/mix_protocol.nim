@@ -525,10 +525,35 @@ proc selectRandomNodes(
 ): Result[seq[MixPubInfo], string] =
   mixProto.pool.selectRandomNodes(count, @[mixProto.mixNodeInfo.peerId] & @exclude)
 
+proc selectReplyPeer*(
+    mixProto: MixProtocol, excluded: seq[PeerId]
+): Future[Result[PeerId, string]] {.async: (raises: [CancelledError]).} =
+  ## Ask the pool for the final peer of a reply path.
+  await mixProto.pool.selectReplyPeer(excluded)
+
 method buildSurb*(
-    mixProto: MixProtocol, id: SURBIdentifier, destPeerId: PeerId, exitPeerId: PeerId
+    mixProto: MixProtocol,
+    id: SURBIdentifier,
+    destPeerId: PeerId,
+    exitPeerId: PeerId,
+    finalPeer: Opt[PeerId] = Opt.none(PeerId),
 ): Result[SURB, string] {.base, gcsafe, raises: [].} =
-  var selected = ?mixProto.selectRandomNodes(PathLength - 1, [destPeerId, exitPeerId])
+  ## Select the final peer at random when the caller supplies none.
+  ## `buildSurbs` passes the pool's choice from `selectReplyPeer`.
+  let excluded = [mixProto.mixNodeInfo.peerId, destPeerId, exitPeerId]
+  let finalPeerId = finalPeer.valueOr:
+    let candidates = ?mixProto.selectRandomNodes(1, [destPeerId, exitPeerId])
+    candidates[0].peerId
+  if finalPeerId in excluded:
+    return err("selected reply peer is excluded from this route")
+  # Read the record again after the await. The pool can drop the peer or
+  # change its keys or address while this node waits.
+  let finalHop = (?mixProto.pool.usablePeer(finalPeerId)).valueOr:
+    return err("selected reply peer is no longer usable")
+  var selected = ?mixProto.selectRandomNodes(
+    PathLength - 2, [destPeerId, exitPeerId, finalHop.peerId]
+  )
+  selected.add(finalHop)
   selected.add(mixProto.localMixPubInfo())
   var
     publicKeys: seq[FieldElement]
@@ -553,29 +578,34 @@ proc buildSurbs(
     mixProto: MixProtocol,
     incoming: AsyncQueue[seq[byte]],
     numSurbs: uint8,
-    destPeerId: PeerId,
-    exitPeerId: PeerId,
-): Result[tuple[surbs: seq[SURB], session: Opt[SurbSession]], string] =
+    destPeerId, exitPeerId: PeerId,
+): Future[Result[tuple[surbs: seq[SURB], session: Opt[SurbSession]], string]] {.
+    async: (raises: [CancelledError])
+.} =
   if numSurbs == 0:
     # Fire-and-forget send: no reply expected, so nothing to register.
     return ok((@[], Opt.none(SurbSession)))
+  let excluded = @[mixProto.mixNodeInfo.peerId, destPeerId, exitPeerId]
+  if (?mixProto.pool.countUsable(excluded)) < PathLength - 1:
+    return err("not enough usable mix nodes for a reply path")
 
   var response: seq[SURB]
   let session = mixProto.surbStore.newSession()
+  var completed = false
+  defer:
+    if not completed:
+      session.release()
 
   for _ in 0.uint8 ..< numSurbs:
+    let finalPeer = (await mixProto.selectReplyPeer(excluded)).valueOr:
+      return err(error)
     # Uniqueness rests on 128 bits of CSPRNG output, per spec Section 8.7.2
     # Step 2. No collision check: a repeat would mean the RNG has failed, which
     # compromises the SURB reply keys themselves, not just this index.
     var id: SURBIdentifier
     mixProto.rng.generate(id)
-
-    let surb = mixProto.buildSurb(id, destPeerId, exitPeerId).valueOr:
-      # Release whatever this group already registered; a partially built
-      # group can never receive a usable reply.
-      session.release()
+    let surb = mixProto.buildSurb(id, destPeerId, exitPeerId, Opt.some(finalPeer)).valueOr:
       return err(error)
-
     mixProto.surbStore.add(
       id,
       ConnCreds(
@@ -585,27 +615,11 @@ proc buildSurbs(
         surbKey: surb.key,
       ),
     ).isOkOr:
-      session.release()
       return err(error)
-
     response.add(surb)
 
+  completed = true
   return ok((response, Opt.some(session)))
-
-proc prepareMsgWithSurbs(
-    mixProto: MixProtocol,
-    incoming: AsyncQueue[seq[byte]],
-    msg: sink seq[byte],
-    numSurbs: uint8 = 0,
-    destPeerId: PeerId,
-    exitPeerId: PeerId,
-): Result[tuple[msg: seq[byte], session: Opt[SurbSession]], string] =
-  let built = mixProto.buildSurbs(incoming, numSurbs, destPeerId, exitPeerId).valueOr:
-    return err(error)
-  let serialized = serializeMessageWithSURBs(msg, built.surbs).valueOr:
-    built.session.get(nil).release()
-    return err(error)
-  ok((serialized, built.session))
 
 type SendPacketLogType* = enum
   Entry
@@ -819,28 +833,30 @@ proc anonymizeLocalProtocolSend*(
     else:
       Hop()
 
-  var prepared = mixProto.prepareMsgWithSurbs(
-    incoming, move(msg), numSurbs, destination.peerId, exitPeerId
+  let prepared = (
+    await mixProto.buildSurbs(incoming, numSurbs, destination.peerId, exitPeerId)
   ).valueOr:
-    return err(fmt"Could not prepend SURBs: {error}")
-
+    return err(fmt"Could not build SURBs: {error}")
   let session = prepared.session
 
-  # Past this point the reply credentials are registered, so every failure
-  # must release them: the packet never left this process, so no reply can
-  # ever arrive to clean them up.
-  template releaseAndFail(msg: string): auto =
-    session.get(nil).release()
-    return err(msg)
+  # Past this point the reply credentials are registered. The caller gets the
+  # handle to them only when the send completes, so every other exit releases
+  # them here.
+  var sent = false
+  defer:
+    if not sent:
+      session.get(nil).release()
 
-  let message = buildMessage(move(prepared.msg), codec).valueOr:
+  var serialized = serializeMessageWithSURBs(msg, prepared.surbs).valueOr:
+    return err(fmt"Could not prepend SURBs: {error}")
+  let message = buildMessage(move(serialized), codec).valueOr:
     mix_messages_error.inc(labelValues = ["Entry", error[1]])
-    releaseAndFail(fmt"Error building message: {error[0]}")
+    return err(fmt"Error building message: {error[0]}")
 
   # Wrap in Sphinx packet
   let sphinxPacket = wrapInSphinxPacket(message, publicKeys, delays, hop, destHop).valueOr:
     mix_messages_error.inc(labelValues = ["Entry", "NON_RECOVERABLE"])
-    releaseAndFail(fmt"Failed to wrap in sphinx packet: {error}")
+    return err(fmt"Failed to wrap in sphinx packet: {error}")
 
   # Claim a slot for local origination (Mix Cover Traffic spec §6.3).
   # Claimed here rather than on entry so that a slot is only consumed by a
@@ -850,7 +866,7 @@ proc anonymizeLocalProtocolSend*(
     let claim = ct.slotPool.claimSlot()
     if not claim.success:
       mix_slot_claim_rejected.inc(labelValues = ["send"])
-      releaseAndFail("No slots available in current epoch")
+      return err("No slots available in current epoch")
     # Reclaim proof token from discarded cover packet for messageId reuse
     if claim.reclaimedToken.len > 0:
       mixProto.spamProtection.withValue(sp):
@@ -858,8 +874,9 @@ proc anonymizeLocalProtocolSend*(
 
   # Send the wrapped message to the first mix node in the selected path
   (await mixProto.sendPacket(nextHopPeerId, nextHopAddr, sphinxPacket, logConfig)).isOkOr:
-    releaseAndFail(error)
+    return err(error)
 
+  sent = true
   return ok(session)
 
 proc sendSurbReply*(

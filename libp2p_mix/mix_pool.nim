@@ -12,7 +12,7 @@
 {.push raises: [].}
 
 import std/sets
-import chronicles, metrics, results
+import chronicles, chronos, metrics, results
 import libp2p/[peerid, multiaddress, crypto/crypto, crypto/secp]
 import libp2p/crypto/curve25519
 import ./mix_metrics, ./mix_node
@@ -99,3 +99,13 @@ proc selectRandomNodes*(
   if usable.len < count:
     return err(NotEnoughMixNodes)
   ok(pool.rng.pick(usable, count).get())
+
+method selectReplyPeer*(
+    pool: MixPool, excluded: seq[PeerId]
+): Future[Result[PeerId, string]] {.base, async: (raises: [CancelledError]).} =
+  ## The final peer of a reply path, the hop that delivers the reply to this
+  ## node. The default takes one usable peer at random. A host that knows its
+  ## connectivity overrides this, for example to prefer a connected peer.
+  let peers = pool.selectRandomNodes(1, excluded).valueOr:
+    return err(error)
+  return ok(peers[0].peerId)

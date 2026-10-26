@@ -85,3 +85,14 @@ suite "MixPool":
     check pool.usablePeer(info.peerId).isErr
     check pool.countUsable([]).isErr
     check pool.selectRandomNodes(1, []).isErr
+    check (waitFor pool.selectReplyPeer(@[])).isErr
+
+  test "the default reply selection takes one usable peer that is not excluded":
+    let pool = HostPool.new()
+    let infos = MixNodeInfo.generateRandomMany(3, rng()).mapIt(it.toMixPubInfo())
+    for info in infos:
+      pool.addPeer(info)
+    for _ in 0 ..< 20:
+      let peer = (waitFor pool.selectReplyPeer(@[infos[0].peerId])).get()
+      check peer in [infos[1].peerId, infos[2].peerId]
+    check (waitFor pool.selectReplyPeer(infos.mapIt(it.peerId))).isErr
