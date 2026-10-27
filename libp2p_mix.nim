@@ -4,8 +4,10 @@
 import
   ./libp2p_mix/[
     mix_protocol, mix_node, entry_connection, exit_layer, spam_protection,
-    delay_strategy, pool,
+    delay_strategy, pool, mix_pool,
   ]
+import ./libp2p_mix/external_pool
+import ./libp2p_mix/mix_events
 import libp2p/stream/connection
 import chronos
 
@@ -23,6 +25,7 @@ export destReadBehaviorCb
 export DestReadBehavior
 export registerDestReadBehavior
 export localMixPubInfo
+export selectReplyPeer
 export setLocalMultiAddr
 export buildCoverPacket
 export sendCoverPacket
@@ -43,6 +46,15 @@ export MixNodePool
 export add
 export remove
 export peerIds
+
+# Pool types.
+export MixPool, MixPeerRecord, readPeer, listPeerIds, usablePeer, countUsable
+export selectRandomNodes, NotEnoughMixNodes
+# A host that answers an ExternalMixPool imports libp2p_mix/external_pool for
+# its three requests.
+export ExternalMixPool
+# A host that backs off the peers that Mix cannot dial listens to this event.
+export MixHopDialFailed
 
 proc readLp*(maxSize: int): DestReadBehavior =
   ## Create a read behavior that reads length-prefixed messages (varint-encoded length).
