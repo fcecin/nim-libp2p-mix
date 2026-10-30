@@ -47,7 +47,7 @@ export peerIds
 
 # Pool types.
 export MixPool, MixPeerRecord, readPeer, listPeerIds, usablePeer, countUsable
-export selectRandomNodes, NotEnoughMixNodes
+export selectRandomNodes, MixPoolError, MixPoolErrorKind, unavailable, lowPool
 
 proc readLp*(maxSize: int): DestReadBehavior =
   ## Create a read behavior that reads length-prefixed messages (varint-encoded length).

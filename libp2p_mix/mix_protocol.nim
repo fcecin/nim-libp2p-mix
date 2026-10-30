@@ -518,20 +518,22 @@ proc getMaxMessageSizeForCodec*(
     return err("cannot encode messages for this codec")
   return ok(DataSize - totalLen)
 
-func poolErrorLabel(error: string): string =
+func poolErrorLabel(error: MixPoolError): string =
   ## The metric label of a failed path selection.
-  if error == NotEnoughMixNodes: "LOW_MIX_POOL" else: "POOL_UNAVAILABLE"
+  case error.kind
+  of LowPool: "LOW_MIX_POOL"
+  of PoolUnavailable: "POOL_UNAVAILABLE"
 
 proc selectRandomNodes(
     mixProto: MixProtocol, count: int, exclude: openArray[PeerId]
-): Result[seq[MixPubInfo], string] =
+): Result[seq[MixPubInfo], MixPoolError] =
   mixProto.pool.selectRandomNodes(
     mixProto.rng, count, @[mixProto.mixNodeInfo.peerId] & @exclude
   )
 
 proc selectReplyPeer*(
     mixProto: MixProtocol, excluded: seq[PeerId]
-): Future[Result[PeerId, string]] {.async: (raises: [CancelledError]).} =
+): Future[Result[PeerId, MixPoolError]] {.async: (raises: [CancelledError]).} =
   ## Ask the pool for the final peer of a reply path.
   await mixProto.pool.selectReplyPeer(mixProto.rng, excluded)
 
@@ -546,17 +548,21 @@ method buildSurb*(
   ## `buildSurbs` passes the pool's choice from `selectReplyPeer`.
   let excluded = [mixProto.mixNodeInfo.peerId, destPeerId, exitPeerId]
   let finalPeerId = finalPeer.valueOr:
-    let candidates = ?mixProto.selectRandomNodes(1, [destPeerId, exitPeerId])
+    let candidates = mixProto.selectRandomNodes(1, [destPeerId, exitPeerId]).valueOr:
+      return err("issue in buildSurb when calling selectRandomNodes: " & error.msg)
     candidates[0].peerId
   if finalPeerId in excluded:
     return err("selected reply peer is excluded from this route")
   # Read the record again. The caller can await the pool's choice, and the
   # pool can drop the peer or change its keys or address in that time.
-  let finalHop = (?mixProto.pool.usablePeer(finalPeerId)).valueOr:
+  let finalRecord = mixProto.pool.usablePeer(finalPeerId).valueOr:
+    return err("issue in buildSurb when calling usablePeer: " & error.msg)
+  let finalHop = finalRecord.valueOr:
     return err("selected reply peer is no longer usable")
-  var selected = ?mixProto.selectRandomNodes(
+  var selected = mixProto.selectRandomNodes(
     PathLength - 2, [destPeerId, exitPeerId, finalHop.peerId]
-  )
+  ).valueOr:
+    return err("issue in buildSurb when calling selectRandomNodes: " & error.msg)
   selected.add(finalHop)
   selected.add(mixProto.localMixPubInfo())
   var
@@ -591,8 +597,8 @@ proc buildSurbs(
     return ok((@[], Opt.none(SurbSession)))
   let excluded = @[mixProto.mixNodeInfo.peerId, destPeerId, exitPeerId]
   let usable = mixProto.pool.countUsable(excluded).valueOr:
-    mix_messages_error.inc(labelValues = ["Entry/SURB", "POOL_UNAVAILABLE"])
-    return err(error)
+    mix_messages_error.inc(labelValues = ["Entry/SURB", poolErrorLabel(error)])
+    return err("issue in buildSurbs when calling countUsable: " & error.msg)
   if usable < PathLength - 1:
     mix_messages_error.inc(labelValues = ["Entry/SURB", "LOW_MIX_POOL"])
     return err("not enough usable mix nodes for a reply path")
@@ -607,7 +613,7 @@ proc buildSurbs(
   for _ in 0.uint8 ..< numSurbs:
     let finalPeer = (await mixProto.selectReplyPeer(excluded)).valueOr:
       mix_messages_error.inc(labelValues = ["Entry/SURB", poolErrorLabel(error)])
-      return err(error)
+      return err("issue in buildSurbs when calling selectReplyPeer: " & error.msg)
     # Uniqueness rests on 128 bits of CSPRNG output, per spec Section 8.7.2
     # Step 2. No collision check: a repeat would mean the RNG has failed, which
     # compromises the SURB reply keys themselves, not just this index.
@@ -807,16 +813,25 @@ proc anonymizeLocalProtocolSend*(
   of ForwardAddr:
     selected = mixProto.selectRandomNodes(PathLength, [destination.peerId]).valueOr:
       mix_messages_error.inc(labelValues = ["Entry", poolErrorLabel(error)])
-      return err(error)
+      return err(
+        "issue in anonymizeLocalProtocolSend when calling selectRandomNodes: " &
+          error.msg
+      )
     exitPeerId = selected[^1].peerId
   of MixNode:
     if destination.peerId == mixProto.mixNodeInfo.peerId:
       return err("Destination must be a remote mix node")
-    let exit = (?mixProto.pool.usablePeer(destination.peerId)).valueOr:
+    let exitRecord = mixProto.pool.usablePeer(destination.peerId).valueOr:
+      return
+        err("issue in anonymizeLocalProtocolSend when calling usablePeer: " & error.msg)
+    let exit = exitRecord.valueOr:
       return err("Destination does not support mix")
     selected = mixProto.selectRandomNodes(PathLength - 1, [destination.peerId]).valueOr:
       mix_messages_error.inc(labelValues = ["Entry", poolErrorLabel(error)])
-      return err(error)
+      return err(
+        "issue in anonymizeLocalProtocolSend when calling selectRandomNodes: " &
+          error.msg
+      )
     selected.add(exit)
     exitPeerId = exit.peerId
 
@@ -927,7 +942,7 @@ proc buildCoverPacket*(
   ## Build a cover Sphinx packet with a loop path (self = exit node),
   ## random payload .
   let nodes = mixProto.selectRandomNodes(PathLength - 1, []).valueOr:
-    return err(error)
+    return err("issue in buildCoverPacket when calling selectRandomNodes: " & error.msg)
 
   var
     publicKeys: seq[FieldElement] = @[]

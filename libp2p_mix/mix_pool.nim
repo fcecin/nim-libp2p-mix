@@ -23,9 +23,24 @@ logScope:
 
 export results, mix_node.MixPubInfo
 
-const NotEnoughMixNodes* = "not enough usable mix nodes for a path"
-  ## The `selectRandomNodes` error when the pool answers but has too few usable
-  ## peers. Any other error means that the pool could not answer.
+type
+  MixPoolErrorKind* = enum
+    PoolUnavailable ## The pool could not answer. Also the zero value of the type.
+    LowPool ## The pool answered with too few usable peers for a path.
+
+  MixPoolError* = object
+    ## A pool selection error. `kind` distinguishes too few usable peers from
+    ## pool failure, and `msg` gives the cause.
+    kind*: MixPoolErrorKind
+    msg*: string
+
+func unavailable*(T: type MixPoolError, msg: string): T =
+  ## An error when the pool cannot answer.
+  T(kind: PoolUnavailable, msg: msg)
+
+func lowPool*(T: type MixPoolError, msg: string): T =
+  ## An error for too few usable peers.
+  T(kind: LowPool, msg: msg)
 
 type MixPeerRecord* = object
   ## What a pool knows about one peer. An empty record means an unknown or
@@ -60,15 +75,22 @@ proc usablePeer*(record: MixPeerRecord, peerId: PeerId): Opt[MixPubInfo] =
       )
   Opt.none(MixPubInfo)
 
-proc usablePeer*(pool: MixPool, peerId: PeerId): Result[Opt[MixPubInfo], string] =
+proc usablePeer*(pool: MixPool, peerId: PeerId): Result[Opt[MixPubInfo], MixPoolError] =
   ## Read one peer and check it as a route hop.
-  ok((?pool.readPeer(peerId)).usablePeer(peerId))
+  let record = pool.readPeer(peerId).valueOr:
+    return
+      err(MixPoolError.unavailable("readPeer failed for " & $peerId & ": " & error))
+  ok(record.usablePeer(peerId))
 
-proc countUsable*(pool: MixPool, exclude: openArray[PeerId]): Result[int, string] =
+proc countUsable*(
+    pool: MixPool, exclude: openArray[PeerId]
+): Result[int, MixPoolError] =
   ## Count the usable peers that are not excluded. A peer counts once.
+  let ids = pool.listPeerIds().valueOr:
+    return err(MixPoolError.unavailable("listPeerIds failed: " & error))
   var seen: HashSet[PeerId]
   var count = 0
-  for peerId in ?pool.listPeerIds():
+  for peerId in ids:
     if peerId in exclude or seen.containsOrIncl(peerId):
       continue
     if (?pool.usablePeer(peerId)).isSome:
@@ -77,23 +99,29 @@ proc countUsable*(pool: MixPool, exclude: openArray[PeerId]): Result[int, string
 
 proc selectRandomNodes*(
     pool: MixPool, rng: Rng, count: int, exclude: openArray[PeerId]
-): Result[seq[MixPubInfo], string] =
+): Result[seq[MixPubInfo], MixPoolError] =
   ## Shuffle candidate IDs, then read until `count` distinct usable peers fill
   ## the path. Count each peer skipped for missing keys or an unencodable address.
   if count < 0:
-    return err("mix peer count must not be negative")
+    return err(MixPoolError.unavailable("mix peer count must not be negative"))
   if count == 0:
     return ok(newSeq[MixPubInfo]())
   doAssert not rng.isNil, "selectRandomNodes needs an RNG"
   var seen: HashSet[PeerId]
+  let ids = pool.listPeerIds().valueOr:
+    return err(MixPoolError.unavailable("listPeerIds failed: " & error))
   var candidates: seq[PeerId]
-  for peerId in ?pool.listPeerIds():
+  for peerId in ids:
     if peerId in exclude or seen.containsOrIncl(peerId):
       continue
     candidates.add(peerId)
   # `pick` of every ID is a uniform shuffle. The libp2p `shuffle` is biased.
   let order = rng.pick(candidates, candidates.len).valueOr:
-    return err(NotEnoughMixNodes)
+    return err(
+      MixPoolError.lowPool(
+        "not enough usable mix nodes for a path, usable: 0, needed: " & $count
+      )
+    )
   var usable: seq[MixPubInfo]
   for peerId in order:
     let info = (?pool.usablePeer(peerId)).valueOr:
@@ -103,14 +131,24 @@ proc selectRandomNodes*(
     usable.add(info)
     if usable.len == count:
       return ok(usable)
-  err(NotEnoughMixNodes)
+  err(
+    MixPoolError.lowPool(
+      "not enough usable mix nodes for a path, usable: " & $usable.len & ", needed: " &
+        $count
+    )
+  )
 
 method selectReplyPeer*(
     pool: MixPool, rng: Rng, excluded: seq[PeerId]
-): Future[Result[PeerId, string]] {.base, async: (raises: [CancelledError]).} =
+): Future[Result[PeerId, MixPoolError]] {.base, async: (raises: [CancelledError]).} =
   ## The final peer of a reply path, the hop that delivers the reply to this
   ## node. The default takes one usable peer at random. A host that knows its
   ## connectivity overrides this, for example to prefer a connected peer.
   let peers = pool.selectRandomNodes(rng, 1, excluded).valueOr:
-    return err(error)
+    return err(
+      MixPoolError(
+        kind: error.kind,
+        msg: "issue in selectReplyPeer when calling selectRandomNodes: " & error.msg,
+      )
+    )
   return ok(peers[0].peerId)

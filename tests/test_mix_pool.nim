@@ -40,7 +40,7 @@ suite "MixPool":
     check pool.listPeerIds().get().len == 2
     check pool.countUsable([]).get() == 1
     check pool.countUsable([infos[0].peerId, infos[0].peerId]).get() == 0
-    check pool.selectRandomNodes(rng(), 2, []).isErr
+    check pool.selectRandomNodes(rng(), 2, []).error.kind == LowPool
     check pool.selectRandomNodes(rng(), 1, []).get() == @[infos[0]]
     check store[MixPubKeyBook].len == 2
 
@@ -82,10 +82,10 @@ suite "MixPool":
   test "a pool error fails every read and selection":
     let pool = FailingPool()
     let info = MixNodeInfo.generateRandom(0, rng()).toMixPubInfo()
-    check pool.usablePeer(info.peerId).isErr
-    check pool.countUsable([]).isErr
-    check pool.selectRandomNodes(rng(), 1, []).isErr
-    check (waitFor pool.selectReplyPeer(rng(), @[])).isErr
+    check pool.usablePeer(info.peerId).error.kind == PoolUnavailable
+    check pool.countUsable([]).error.kind == PoolUnavailable
+    check pool.selectRandomNodes(rng(), 1, []).error.kind == PoolUnavailable
+    check (waitFor pool.selectReplyPeer(rng(), @[])).error.kind == PoolUnavailable
 
   test "the default reply selection takes one usable peer that is not excluded":
     let pool = HostPool.new()
@@ -98,4 +98,5 @@ suite "MixPool":
       check peer in [infos[1].peerId, infos[2].peerId]
       chosen.incl(peer)
     check chosen.len == 2
-    check (waitFor pool.selectReplyPeer(rng(), infos.mapIt(it.peerId))).isErr
+    check (waitFor pool.selectReplyPeer(rng(), infos.mapIt(it.peerId))).error.kind ==
+      LowPool

@@ -34,16 +34,16 @@ method listPeerIds(
 
 method selectReplyPeer(
     pool: SelectingPool, rng: Rng, excluded: seq[PeerId]
-): Future[Result[PeerId, string]] {.async: (raises: [CancelledError]).} =
+): Future[Result[PeerId, MixPoolError]] {.async: (raises: [CancelledError]).} =
   if pool.mode == "reply":
-    return err("reply selection failed")
+    return err(MixPoolError.unavailable("reply selection failed"))
   pool.calls.inc()
   if pool.mode == "excluded":
     return ok(excluded[^1])
   if pool.calls == 2:
     pool.credentialsAtSecond = pool.mix.surbCredsLen
     if pool.mode == "error":
-      return err("host refused the second reply peer")
+      return err(MixPoolError.unavailable("host refused the second reply peer"))
   let peer = (?pool.selectRandomNodes(rng, 1, excluded))[0].peerId
   if pool.mode == "withdrawn":
     discard pool.removePeer(peer)
@@ -56,7 +56,7 @@ type PinnedPool = ref object of HostPool
 
 method selectReplyPeer(
     pool: PinnedPool, rng: Rng, excluded: seq[PeerId]
-): Future[Result[PeerId, string]] {.async: (raises: [CancelledError]).} =
+): Future[Result[PeerId, MixPoolError]] {.async: (raises: [CancelledError]).} =
   ok(pool.replyPeer)
 
 proc sendWithReplies(mode: string): Future[SelectingPool] {.async.} =
