@@ -48,7 +48,7 @@ proc mixPingSimulation() {.async: (raises: [Exception]).} =
   for nodeInfo in mixNodeInfos:
     var switch = createSwitch(nodeInfo.multiAddr, rng, Opt.some(nodeInfo.libp2pPrivKey))
     let pool = MixNodePool.new(switch.peerStore)
-    let proto = MixProtocol.new(nodeInfo, switch, pool = pool)
+    let proto = MixProtocol.new(nodeInfo, switch, pool)
 
     # Add all other nodes to this node's pool
     pool.add(mixNodeInfos.includeAllExcept(nodeInfo))

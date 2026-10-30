@@ -1084,12 +1084,12 @@ proc init*(
     mixProto: MixProtocol,
     mixNodeInfo: MixNodeInfo,
     switch: Switch,
+    pool: MixPool = nil,
     tagManager: TagManager = TagManager.new(),
     spamProtection: Opt[SpamProtection] = default(Opt[SpamProtection]),
     delayStrategy: Opt[DelayStrategy] = Opt.none(DelayStrategy),
     coverTraffic: Opt[CoverTraffic] = Opt.none(CoverTraffic),
     surbStore: SurbStore = nil,
-    pool: MixPool = nil,
 ) {.raises: [].} =
   ## Initialize a MixProtocol instance.
   ##
@@ -1206,12 +1206,12 @@ proc new*(
     T: typedesc[MixProtocol],
     mixNodeInfo: MixNodeInfo,
     switch: Switch,
+    pool: MixPool = nil,
     tagManager: TagManager = TagManager.new(),
     spamProtection: Opt[SpamProtection] = default(Opt[SpamProtection]),
     delayStrategy: Opt[DelayStrategy] = Opt.none(DelayStrategy),
     coverTraffic: Opt[CoverTraffic] = Opt.none(CoverTraffic),
     surbStore: SurbStore = nil,
-    pool: MixPool = nil,
 ): T {.raises: [].} =
   ## Create a new MixProtocol instance.
   ##
@@ -1223,7 +1223,7 @@ proc new*(
   ## generation and short exponential delays.
   let mixProto = new(T)
   mixProto.init(
-    mixNodeInfo, switch, tagManager, spamProtection, delayStrategy, coverTraffic,
-    surbStore, pool,
+    mixNodeInfo, switch, pool, tagManager, spamProtection, delayStrategy, coverTraffic,
+    surbStore,
   )
   mixProto
