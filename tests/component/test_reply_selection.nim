@@ -63,10 +63,11 @@ method selectReplyPeer(
   ok(pool.replyPeer)
 
 proc sendWithReplies(
-    mode: string, replyPeerTimeout = DefaultReplyPeerTimeout
+    mode: string, replyPeerTimeout = DefaultReplyPeerTimeout, cancelAfter = ZeroDuration
 ): Future[SelectingPool] {.async.} =
   ## Send one request with two SURBs through a fresh sender, expect it to
-  ## fail, and return the sender's pool for the checks.
+  ## fail, and return the sender's pool. A positive `cancelAfter` cancels the
+  ## send after that time.
   let info = MixNodeInfo.generateRandom(0, rng())
   let sw = createSwitch(info.multiAddr, Opt.some(info.libp2pPrivKey))
   let pool = SelectingPool(mode: mode, store: PeerStore.new())
@@ -96,8 +97,12 @@ proc sendWithReplies(
     .get()
   defer:
     await conn.close()
-  expect LPStreamError:
-    await conn.writeLp(@[1'u8]).wait(2.seconds)
+  if cancelAfter == ZeroDuration:
+    expect LPStreamError:
+      await conn.writeLp(@[1'u8]).wait(2.seconds)
+  else:
+    expect AsyncTimeoutError:
+      await conn.writeLp(@[1'u8]).wait(cancelAfter)
   check:
     mix.surbCredsLen == 0
     mix.switch.connectedPeers().len == 0
@@ -135,6 +140,12 @@ suite "Pool selection of the final reply peer":
       pool.calls == 2
       pool.credentialsAtSecond == 1
       mix_messages_error.value(["Entry/SURB", "POOL_UNAVAILABLE"]) == before + 1
+
+  asyncTest "a send cancelled during the reply selection releases the credentials":
+    let pool = await sendWithReplies("hang", cancelAfter = 300.milliseconds)
+    check:
+      pool.calls == 2
+      pool.credentialsAtSecond == 1
 
   asyncTest "a host-chosen connected peer delivers the reply to a sender that no one can dial":
     let nodes = await startTestMixNodes(4)
