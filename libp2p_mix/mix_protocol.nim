@@ -525,13 +525,15 @@ func poolErrorLabel(error: string): string =
 proc selectRandomNodes(
     mixProto: MixProtocol, count: int, exclude: openArray[PeerId]
 ): Result[seq[MixPubInfo], string] =
-  mixProto.pool.selectRandomNodes(count, @[mixProto.mixNodeInfo.peerId] & @exclude)
+  mixProto.pool.selectRandomNodes(
+    mixProto.rng, count, @[mixProto.mixNodeInfo.peerId] & @exclude
+  )
 
 proc selectReplyPeer*(
     mixProto: MixProtocol, excluded: seq[PeerId]
 ): Future[Result[PeerId, string]] {.async: (raises: [CancelledError]).} =
   ## Ask the pool for the final peer of a reply path.
-  await mixProto.pool.selectReplyPeer(excluded)
+  await mixProto.pool.selectReplyPeer(mixProto.rng, excluded)
 
 method buildSurb*(
     mixProto: MixProtocol,
@@ -1091,7 +1093,7 @@ proc init*(
   mixProto.rng = switch.rng
   mixProto.pool =
     if pool.isNil:
-      MixNodePool.new(switch.peerStore, switch.rng)
+      MixNodePool.new(switch.peerStore)
     else:
       pool
   mixProto.tagManager = tagManager

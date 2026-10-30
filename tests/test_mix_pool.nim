@@ -33,37 +33,37 @@ method listPeerIds(
 suite "MixPool":
   test "the stock pool keeps its raw membership while routes skip incomplete peers":
     let store = PeerStore.new()
-    let pool = MixNodePool.new(store, rng())
+    let pool = MixNodePool.new(store)
     let infos = MixNodeInfo.generateRandomMany(3, rng()).mapIt(it.toMixPubInfo())
     pool.add(infos[0])
     store[MixPubKeyBook][infos[1].peerId] = infos[1].mixPubKey
     check pool.listPeerIds().get().len == 2
     check pool.countUsable([]).get() == 1
     check pool.countUsable([infos[0].peerId, infos[0].peerId]).get() == 0
-    check pool.selectRandomNodes(2, []).isErr
-    check pool.selectRandomNodes(1, []).get() == @[infos[0]]
+    check pool.selectRandomNodes(rng(), 2, []).isErr
+    check pool.selectRandomNodes(rng(), 1, []).get() == @[infos[0]]
     check store[MixPubKeyBook].len == 2
 
   test "an identity the wire format cannot encode is unusable and stays stored":
     let store = PeerStore.new()
-    let pool = MixNodePool.new(store, rng())
+    let pool = MixNodePool.new(store)
     var info = MixNodeInfo.generateRandom(9000, rng()).toMixPubInfo()
     info.peerId = PeerId()
     pool.add(info)
     check pool.usablePeer(info.peerId).get().isNone
     check pool.countUsable([]).get() == 0
-    check pool.selectRandomNodes(1, []).isErr
+    check pool.selectRandomNodes(rng(), 1, []).isErr
     check store[MixPubKeyBook].len == 1
 
   test "duplicate IDs count once and never repeat a hop":
-    let pool = RepeatingPool(store: PeerStore.new(), rng: rng())
+    let pool = RepeatingPool(store: PeerStore.new())
     for node in MixNodeInfo.generateRandomMany(2, rng()):
       pool.addPeer(node.toMixPubInfo())
     check pool.listPeerIds().get().len == 4
     check pool.countUsable([]).get() == 2
-    check pool.selectRandomNodes(3, []).isErr
+    check pool.selectRandomNodes(rng(), 3, []).isErr
     for _ in 0 ..< 30:
-      let selected = pool.selectRandomNodes(2, []).get()
+      let selected = pool.selectRandomNodes(rng(), 2, []).get()
       check selected[0].peerId != selected[1].peerId
 
   test "host exclusions and recovery affect every routing query immediately":
@@ -74,18 +74,18 @@ suite "MixPool":
     check pool.usablePeer(info.peerId).get().isNone
     check pool.listPeerIds().get().len == 0
     check pool.countUsable([]).get() == 0
-    check pool.selectRandomNodes(1, []).isErr
+    check pool.selectRandomNodes(rng(), 1, []).isErr
     check pool.store[MixPubKeyBook][info.peerId] == info.mixPubKey
     pool.restore(info.peerId)
-    check pool.selectRandomNodes(1, []).get() == @[info]
+    check pool.selectRandomNodes(rng(), 1, []).get() == @[info]
 
   test "a pool error fails every read and selection":
-    let pool = FailingPool(rng: rng())
+    let pool = FailingPool()
     let info = MixNodeInfo.generateRandom(0, rng()).toMixPubInfo()
     check pool.usablePeer(info.peerId).isErr
     check pool.countUsable([]).isErr
-    check pool.selectRandomNodes(1, []).isErr
-    check (waitFor pool.selectReplyPeer(@[])).isErr
+    check pool.selectRandomNodes(rng(), 1, []).isErr
+    check (waitFor pool.selectReplyPeer(rng(), @[])).isErr
 
   test "the default reply selection takes one usable peer that is not excluded":
     let pool = HostPool.new()
@@ -94,8 +94,8 @@ suite "MixPool":
       pool.addPeer(info)
     var chosen: HashSet[PeerId]
     for _ in 0 ..< 32:
-      let peer = (waitFor pool.selectReplyPeer(@[infos[0].peerId])).get()
+      let peer = (waitFor pool.selectReplyPeer(rng(), @[infos[0].peerId])).get()
       check peer in [infos[1].peerId, infos[2].peerId]
       chosen.incl(peer)
     check chosen.len == 2
-    check (waitFor pool.selectReplyPeer(infos.mapIt(it.peerId))).isErr
+    check (waitFor pool.selectReplyPeer(rng(), infos.mapIt(it.peerId))).isErr

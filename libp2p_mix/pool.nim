@@ -31,9 +31,9 @@ type MixNodePool* = ref object of MixPool
   ## protocols on the same switch see the same addresses and keys.
   peerStore: PeerStore
 
-proc new*(T: typedesc[MixNodePool], peerStore: PeerStore, rng: Rng): T =
-  ## Create a pool on `peerStore`. `rng` drives its random selections.
-  T(peerStore: peerStore, rng: rng)
+proc new*(T: typedesc[MixNodePool], peerStore: PeerStore): T =
+  ## Create a pool on `peerStore`.
+  T(peerStore: peerStore)
 
 method readPeer*(
     pool: MixNodePool, peerId: PeerId

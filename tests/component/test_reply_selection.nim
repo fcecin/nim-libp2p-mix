@@ -4,7 +4,7 @@
 {.used.}
 
 import chronos, metrics, results
-import libp2p/[switch, stream/lpstream, peerstore, peerid, multiaddress]
+import libp2p/[switch, stream/lpstream, peerstore, peerid, multiaddress, crypto/crypto]
 import libp2p_mix
 import libp2p_mix/[mix_protocol, delay_strategy, mix_pool, mix_metrics]
 import ../tools/[lifecycle, unittest, crypto, host_pool]
@@ -33,7 +33,7 @@ method listPeerIds(
   procCall listPeerIds(HostPool(pool))
 
 method selectReplyPeer(
-    pool: SelectingPool, excluded: seq[PeerId]
+    pool: SelectingPool, rng: Rng, excluded: seq[PeerId]
 ): Future[Result[PeerId, string]] {.async: (raises: [CancelledError]).} =
   if pool.mode == "reply":
     return err("reply selection failed")
@@ -44,7 +44,7 @@ method selectReplyPeer(
     pool.credentialsAtSecond = pool.mix.surbCredsLen
     if pool.mode == "error":
       return err("host refused the second reply peer")
-  let peer = (?pool.selectRandomNodes(1, excluded))[0].peerId
+  let peer = (?pool.selectRandomNodes(rng, 1, excluded))[0].peerId
   if pool.mode == "withdrawn":
     discard pool.removePeer(peer)
   return ok(peer)
@@ -55,7 +55,7 @@ type PinnedPool = ref object of HostPool
   replyPeer: PeerId
 
 method selectReplyPeer(
-    pool: PinnedPool, excluded: seq[PeerId]
+    pool: PinnedPool, rng: Rng, excluded: seq[PeerId]
 ): Future[Result[PeerId, string]] {.async: (raises: [CancelledError]).} =
   ok(pool.replyPeer)
 
@@ -64,7 +64,7 @@ proc sendWithReplies(mode: string): Future[SelectingPool] {.async.} =
   ## fail, and return the sender's pool for the checks.
   let info = MixNodeInfo.generateRandom(0, rng())
   let sw = createSwitch(info.multiAddr, Opt.some(info.libp2pPrivKey))
-  let pool = SelectingPool(mode: mode, store: PeerStore.new(), rng: rng())
+  let pool = SelectingPool(mode: mode, store: PeerStore.new())
   let mix = MixProtocol.new(
     info,
     sw,
@@ -135,7 +135,7 @@ suite "Pool selection of the final reply peer":
     # only over the connection that the sender opened to the chosen peer.
     let info = MixNodeInfo.generateRandom(0, rng())
     let sw = createSwitch(info.multiAddr, Opt.some(info.libp2pPrivKey))
-    let pool = PinnedPool(store: PeerStore.new(), rng: rng())
+    let pool = PinnedPool(store: PeerStore.new())
     let sender = MixProtocol.new(
       info,
       sw,

@@ -350,7 +350,7 @@ suite "Mix Protocol - Node Failures":
       valid.add(nodes[0].nodePool.get(nodes[i].switch.peerInfo.peerId).get())
     # Read peers from the store books only, without the records that the fixture
     # added.
-    nodes[0].pool = MixNodePool.new(senderStore, rng())
+    nodes[0].pool = MixNodePool.new(senderStore)
     for info in valid:
       senderStore[MixPubKeyBook][info.peerId] = info.mixPubKey
       senderStore[AddressBook][info.peerId] = @[info.multiAddr]

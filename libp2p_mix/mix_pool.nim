@@ -35,7 +35,6 @@ type MixPeerRecord* = object
   addresses*: seq[MultiAddress]
 
 type MixPool* = ref object of RootObj ## The peers a MixProtocol routes through.
-  rng*: Rng ## Drives the random selections below. The derived pool sets it.
 
 method readPeer*(
     pool: MixPool, peerId: PeerId
@@ -77,7 +76,7 @@ proc countUsable*(pool: MixPool, exclude: openArray[PeerId]): Result[int, string
   ok(count)
 
 proc selectRandomNodes*(
-    pool: MixPool, count: int, exclude: openArray[PeerId]
+    pool: MixPool, rng: Rng, count: int, exclude: openArray[PeerId]
 ): Result[seq[MixPubInfo], string] =
   ## Shuffle candidate IDs, then read until `count` distinct usable peers fill
   ## the path. Count each peer skipped for missing keys or an unencodable address.
@@ -85,7 +84,7 @@ proc selectRandomNodes*(
     return err("mix peer count must not be negative")
   if count == 0:
     return ok(newSeq[MixPubInfo]())
-  doAssert not pool.rng.isNil, "MixPool has no RNG"
+  doAssert not rng.isNil, "selectRandomNodes needs an RNG"
   var seen: HashSet[PeerId]
   var candidates: seq[PeerId]
   for peerId in ?pool.listPeerIds():
@@ -93,7 +92,7 @@ proc selectRandomNodes*(
       continue
     candidates.add(peerId)
   # `pick` of every ID is a uniform shuffle. The libp2p `shuffle` is biased.
-  let order = pool.rng.pick(candidates, candidates.len).valueOr:
+  let order = rng.pick(candidates, candidates.len).valueOr:
     return err(NotEnoughMixNodes)
   var usable: seq[MixPubInfo]
   for peerId in order:
@@ -107,11 +106,11 @@ proc selectRandomNodes*(
   err(NotEnoughMixNodes)
 
 method selectReplyPeer*(
-    pool: MixPool, excluded: seq[PeerId]
+    pool: MixPool, rng: Rng, excluded: seq[PeerId]
 ): Future[Result[PeerId, string]] {.base, async: (raises: [CancelledError]).} =
   ## The final peer of a reply path, the hop that delivers the reply to this
   ## node. The default takes one usable peer at random. A host that knows its
   ## connectivity overrides this, for example to prefer a connected peer.
-  let peers = pool.selectRandomNodes(1, excluded).valueOr:
+  let peers = pool.selectRandomNodes(rng, 1, excluded).valueOr:
     return err(error)
   return ok(peers[0].peerId)

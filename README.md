@@ -84,7 +84,7 @@ let mixNodeInfo = initMixNodeInfo(
 
 # Mix routes through a MixPool. MixNodePool is the stock one, on the switch
 # peer store. Keep the pool to add nodes to it.
-let pool = MixNodePool.new(switch.peerStore, switch.rng)
+let pool = MixNodePool.new(switch.peerStore)
 let mix = MixProtocol.new(mixNodeInfo, switch, pool = pool)
 
 # Optional: configure how the exit layer reads payloads for a given proto

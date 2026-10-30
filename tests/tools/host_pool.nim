@@ -9,7 +9,6 @@
 import std/[sets, sequtils, tables]
 import results
 import libp2p/[peerstore, peerid, multiaddress, crypto/crypto]
-import ./crypto
 import libp2p_mix/[mix_pool, pool, mix_node, mix_protocol]
 
 export mix_pool, pool
@@ -19,7 +18,7 @@ type HostPool* = ref object of MixPool
   excluded: HashSet[PeerId]
 
 proc new*(T: typedesc[HostPool], store: PeerStore = nil): T =
-  T(store: (if store.isNil: PeerStore.new() else: store), rng: rng())
+  T(store: (if store.isNil: PeerStore.new() else: store))
 
 method readPeer*(
     pool: HostPool, peerId: PeerId
