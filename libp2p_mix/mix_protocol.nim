@@ -32,6 +32,9 @@ const CoverTrafficCodec* = "/mix/cover/1.0.0"
   ## Reserved codec for cover traffic packets. Cover packets use this codec
   ## so the exit node can identify and silently discard returning cover traffic.
 
+const DefaultReplyPeerTimeout* = 10.seconds
+  ## Default time `MixProtocol` waits for the pool's reply peer selection.
+
 func isCoverTraffic*(msg: MixMessage): bool =
   ## Returns true if the message is a cover traffic packet.
   msg.codec == CoverTrafficCodec
@@ -45,6 +48,9 @@ type MixProtocol* = ref object of LPProtocol
   mixNodeInfo: MixNodeInfo
   switch*: Switch
   pool*: MixPool ## The peers this node routes through. See mix_pool.nim.
+  replyPeerTimeout*: Duration
+    ## Time allowed for reply peer selection. On timeout, `MixProtocol` cancels
+    ## the selection and labels the failed send POOL_UNAVAILABLE.
   tagManager: TagManager
   exitLayer: ExitLayer
   rng: Rng
@@ -534,8 +540,18 @@ proc selectRandomNodes(
 proc selectReplyPeer*(
     mixProto: MixProtocol, excluded: seq[PeerId]
 ): Future[Result[PeerId, MixPoolError]] {.async: (raises: [CancelledError]).} =
-  ## Ask the pool for the final peer of a reply path.
-  await mixProto.pool.selectReplyPeer(mixProto.rng, excluded)
+  ## Ask the pool for the final reply peer. Cancel and fail after
+  ## `replyPeerTimeout`.
+  let pending = mixProto.pool.selectReplyPeer(mixProto.rng, excluded)
+  if await pending.withTimeout(mixProto.replyPeerTimeout):
+    return await pending
+  # `withTimeout` does not cancel on a zero timeout.
+  await noCancel pending.cancelAndWait()
+  return err(
+    MixPoolError.unavailable(
+      "the pool did not select a reply peer within " & $mixProto.replyPeerTimeout
+    )
+  )
 
 method buildSurb*(
     mixProto: MixProtocol,
@@ -1106,6 +1122,7 @@ proc init*(
   mixProto.mixNodeInfo = mixNodeInfo
   mixProto.switch = switch
   mixProto.rng = switch.rng
+  mixProto.replyPeerTimeout = DefaultReplyPeerTimeout
   mixProto.pool =
     if pool.isNil:
       MixNodePool.new(switch.peerStore)

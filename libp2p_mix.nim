@@ -12,6 +12,7 @@ import chronos
 export toConnection
 export MixProtocolID
 export MixProtocol
+export DefaultReplyPeerTimeout
 
 export get
 export `new`

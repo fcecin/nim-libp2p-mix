@@ -12,8 +12,8 @@ import ../utils
 
 type SelectingPool = ref object of HostPool
   ## Answers the reply selection for the test. `mode` makes it return an
-  ## excluded peer, withdraw its choice, refuse the second selection, or fail
-  ## one primitive ("read", "list" or "reply").
+  ## excluded peer, withdraw a choice, refuse or hang on the second choice,
+  ## or fail "read", "list", or "reply".
   mix: MixProtocol
   mode: string
   calls, credentialsAtSecond: int
@@ -44,6 +44,9 @@ method selectReplyPeer(
     pool.credentialsAtSecond = pool.mix.surbCredsLen
     if pool.mode == "error":
       return err(MixPoolError.unavailable("host refused the second reply peer"))
+    if pool.mode == "hang":
+      # A hook that never answers. The send times out or is cancelled first.
+      await sleepAsync(1.hours)
   let peer = (?pool.selectRandomNodes(rng, 1, excluded))[0].peerId
   if pool.mode == "withdrawn":
     discard pool.removePeer(peer)
@@ -59,7 +62,9 @@ method selectReplyPeer(
 ): Future[Result[PeerId, MixPoolError]] {.async: (raises: [CancelledError]).} =
   ok(pool.replyPeer)
 
-proc sendWithReplies(mode: string): Future[SelectingPool] {.async.} =
+proc sendWithReplies(
+    mode: string, replyPeerTimeout = DefaultReplyPeerTimeout
+): Future[SelectingPool] {.async.} =
   ## Send one request with two SURBs through a fresh sender, expect it to
   ## fail, and return the sender's pool for the checks.
   let info = MixNodeInfo.generateRandom(0, rng())
@@ -72,6 +77,7 @@ proc sendWithReplies(mode: string): Future[SelectingPool] {.async.} =
     delayStrategy = Opt.some(DelayStrategy(NoSamplingDelayStrategy.new(rng()))),
   )
   pool.mix = mix
+  mix.replyPeerTimeout = replyPeerTimeout
   let peers = MixNodeInfo.generateRandomMany(4, rng())
   for peer in peers:
     pool.addPeer(peer.toMixPubInfo())
@@ -121,6 +127,14 @@ suite "Pool selection of the final reply peer":
     let before = mix_messages_error.value(["Entry/SURB", "POOL_UNAVAILABLE"])
     discard await sendWithReplies("reply")
     check mix_messages_error.value(["Entry/SURB", "POOL_UNAVAILABLE"]) == before + 1
+
+  asyncTest "a pool that does not answer in time fails the send and releases credentials":
+    let before = mix_messages_error.value(["Entry/SURB", "POOL_UNAVAILABLE"])
+    let pool = await sendWithReplies("hang", replyPeerTimeout = 200.milliseconds)
+    check:
+      pool.calls == 2
+      pool.credentialsAtSecond == 1
+      mix_messages_error.value(["Entry/SURB", "POOL_UNAVAILABLE"]) == before + 1
 
   asyncTest "a host-chosen connected peer delivers the reply to a sender that no one can dial":
     let nodes = await startTestMixNodes(4)

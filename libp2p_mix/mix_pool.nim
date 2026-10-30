@@ -143,7 +143,9 @@ method selectReplyPeer*(
 ): Future[Result[PeerId, MixPoolError]] {.base, async: (raises: [CancelledError]).} =
   ## The final peer of a reply path, the hop that delivers the reply to this
   ## node. The default takes one usable peer at random. A host that knows its
-  ## connectivity overrides this, for example to prefer a connected peer.
+  ## connectivity overrides this, for example to prefer a connected peer. A
+  ## hook must return promptly and stop when cancelled. `MixProtocol` cancels a
+  ## selection that exceeds its `replyPeerTimeout` and fails the send.
   let peers = pool.selectRandomNodes(rng, 1, excluded).valueOr:
     return err(
       MixPoolError(
