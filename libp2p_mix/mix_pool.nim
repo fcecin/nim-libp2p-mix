@@ -79,26 +79,32 @@ proc countUsable*(pool: MixPool, exclude: openArray[PeerId]): Result[int, string
 proc selectRandomNodes*(
     pool: MixPool, count: int, exclude: openArray[PeerId]
 ): Result[seq[MixPubInfo], string] =
-  ## Select `count` distinct usable peers at random, in random order.
-  ## Count each skipped peer that lacks keys or an encodable address.
+  ## Shuffle candidate IDs, then read until `count` distinct usable peers fill
+  ## the path. Count each peer skipped for missing keys or an unencodable address.
   if count < 0:
     return err("mix peer count must not be negative")
   if count == 0:
     return ok(newSeq[MixPubInfo]())
   doAssert not pool.rng.isNil, "MixPool has no RNG"
   var seen: HashSet[PeerId]
-  var usable: seq[MixPubInfo]
+  var candidates: seq[PeerId]
   for peerId in ?pool.listPeerIds():
     if peerId in exclude or seen.containsOrIncl(peerId):
       continue
+    candidates.add(peerId)
+  # `pick` of every ID is a uniform shuffle. The libp2p `shuffle` is biased.
+  let order = pool.rng.pick(candidates, candidates.len).valueOr:
+    return err(NotEnoughMixNodes)
+  var usable: seq[MixPubInfo]
+  for peerId in order:
     let info = (?pool.usablePeer(peerId)).valueOr:
       mix_messages_error.inc(labelValues = ["Pool", "INVALID_MIX_INFO"])
       trace "Skipped mix peer without keys or an encodable address", peerId
       continue
     usable.add(info)
-  if usable.len < count:
-    return err(NotEnoughMixNodes)
-  ok(pool.rng.pick(usable, count).get())
+    if usable.len == count:
+      return ok(usable)
+  err(NotEnoughMixNodes)
 
 method selectReplyPeer*(
     pool: MixPool, excluded: seq[PeerId]

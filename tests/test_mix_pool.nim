@@ -3,7 +3,7 @@
 
 {.used.}
 
-import chronos, results, sequtils
+import chronos, results, sequtils, sets
 import libp2p/[crypto/crypto, crypto/secp, peerid, peerstore]
 import libp2p_mix/[mix_node, pool, mix_pool, mix_protocol]
 import ./tools/[unittest, crypto, host_pool]
@@ -92,7 +92,10 @@ suite "MixPool":
     let infos = MixNodeInfo.generateRandomMany(3, rng()).mapIt(it.toMixPubInfo())
     for info in infos:
       pool.addPeer(info)
-    for _ in 0 ..< 20:
+    var chosen: HashSet[PeerId]
+    for _ in 0 ..< 32:
       let peer = (waitFor pool.selectReplyPeer(@[infos[0].peerId])).get()
       check peer in [infos[1].peerId, infos[2].peerId]
+      chosen.incl(peer)
+    check chosen.len == 2
     check (waitFor pool.selectReplyPeer(infos.mapIt(it.peerId))).isErr
