@@ -143,9 +143,18 @@ method selectReplyPeer*(
 ): Future[Result[PeerId, MixPoolError]] {.base, async: (raises: [CancelledError]).} =
   ## The final peer of a reply path, the hop that delivers the reply to this
   ## node. The default takes one usable peer at random. A host that knows its
-  ## connectivity overrides this, for example to prefer a connected peer. A
-  ## hook must return promptly and stop when cancelled. `MixProtocol` cancels a
-  ## selection that exceeds its `replyPeerTimeout` and fails the send.
+  ## connections can override this with a connected peer when this node cannot
+  ## accept connections.
+  ##
+  ## An override meets mix.md 8.5.2 with a small set of connections that the
+  ## host opens ahead of time to peers drawn uniformly from the pool. It takes
+  ## the reply peer from that set, rotates the set one peer at a time with
+  ## jitter, refills it when a connection drops, and keeps a connection until
+  ## the reply arrives or the SURB expires (8.7.2). It does not dial at send
+  ## time, because the dial signals the send. A hook must return promptly and
+  ## stop when cancelled. `MixProtocol` cancels a selection that exceeds
+  ## `replyPeerTimeout` and fails the send.
+
   let peers = pool.selectRandomNodes(rng, 1, excluded).valueOr:
     return err(
       MixPoolError(
