@@ -86,7 +86,8 @@ proc remove*(pool: MixNodePool, peerId: PeerId): bool =
 proc get*(pool: MixNodePool, peerId: PeerId): Opt[MixPubInfo] =
   ## The peer as a route hop. None when the pool lacks its keys or an address
   ## that the wire format can encode.
-  pool.usablePeer(peerId).expect("the stock pool always answers")
+  pool.usablePeer(peerId).valueOr:
+    return Opt.none(MixPubInfo)
 
 proc peerIds*(pool: MixNodePool): seq[PeerId] =
   ## Get all peer IDs in the mix node pool.
