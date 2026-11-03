@@ -36,12 +36,6 @@ func isCoverTraffic*(msg: MixMessage): bool =
   ## Returns true if the message is a cover traffic packet.
   msg.codec == CoverTrafficCodec
 
-type PeerStreamLock = ref object
-  lock: AsyncLock
-    ## Lets one caller of getConn look up and dial for this peer at a time, so
-    ## concurrent sends to the peer reuse one cached stream.
-  users: int ## Callers inside getConn. The last one deletes the entry from streamLocks.
-
 ## Mix Protocol defines a decentralized anonymous message routing layer for libp2p networks.
 ## It enables sender anonymity by routing each message through a decentralized mix overlay
 ## network composed of participating libp2p nodes, known as mix nodes. Each message is
@@ -59,7 +53,7 @@ type MixProtocol* = ref object of LPProtocol
     ## reply never arrives; see surb_store.nim.
   destReadBehaviors: TableRef[string, DestReadBehavior]
   connPool: Table[PeerId, Connection]
-  streamLocks: Table[PeerId, PeerStreamLock]
+  dialing: Table[PeerId, Future[Connection].Raising([DialFailedError, CancelledError])]
   spamProtection: Opt[SpamProtection]
   delayStrategy: DelayStrategy
   coverTraffic*: Opt[CoverTraffic]
@@ -119,29 +113,27 @@ proc getConn(
     codecs: seq[string],
     failed: Connection = nil,
 ): Future[Connection] {.async: (raises: [DialFailedError, CancelledError]).} =
-  var streamLock = mixProto.streamLocks.getOrDefault(pid)
-  if streamLock.isNil:
-    streamLock = PeerStreamLock(lock: newAsyncLock())
-    mixProto.streamLocks[pid] = streamLock
-  streamLock.users.inc()
+  if not failed.isNil:
+    await mixProto.removeClosedConnections(failed)
+  mixProto.connPool.withValue(pid, conn):
+    return conn[]
+  var dial = mixProto.dialing.getOrDefault(pid)
+  if dial.isNil:
+    dial = mixProto.switch.dial(pid, addrs, codecs)
+    mixProto.dialing[pid] = dial
+    let started = dial
+    dial.addCallback(
+      proc(_: pointer) {.gcsafe, raises: [].} =
+        if mixProto.dialing.getOrDefault(pid) == started:
+          mixProto.dialing.del(pid)
+        if started.completed():
+          mixProto.connPool[pid] = started.value
+    )
+  await dial.join()
   try:
-    await streamLock.lock.acquire()
-    defer:
-      try:
-        streamLock.lock.release()
-      except AsyncLockError as exc:
-        raiseAssert "stream lock released without acquire: " & exc.msg
-    if not failed.isNil:
-      await mixProto.removeClosedConnections(failed)
-    mixProto.connPool.withValue(pid, conn):
-      return conn[]
-    let c = await mixProto.switch.dial(pid, addrs, codecs)
-    mixProto.connPool[pid] = c
-    return c
-  finally:
-    streamLock.users.dec()
-    if streamLock.users == 0 and mixProto.streamLocks.getOrDefault(pid) == streamLock:
-      mixProto.streamLocks.del(pid)
+    return dial.read()
+  except FuturePendingError:
+    raiseAssert "the dial finished before join returned"
 
 proc writeLpWithRetry(
     mixProto: MixProtocol,
