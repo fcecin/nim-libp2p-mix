@@ -29,14 +29,15 @@ code follows the spec, not the other way round.
 
 ```
 libp2p_mix.nim            Top-level facade — re-exports the public API
-libp2p_mix/               Protocol implementation (24 modules)
+libp2p_mix/               Protocol implementation (25 modules)
   ├── mix_protocol.nim    Core mix protocol (mounts on a libp2p Switch)
+  ├── mix_pool.nim        MixPool interface for host peers, route and reply selection
   ├── sphinx.nim          Sphinx packet format with LIONESS payload encryption
   ├── cover_traffic.nim   Constant-rate cover-traffic generator
   ├── exit_layer.nim      Exit-node behaviour & dest read framing
   ├── entry_connection.nim/exit_connection.nim/reply_connection.nim
   ├── padding.nim         Fixed-size payload padding
-  ├── pool.nim            Mix node pool / route selection
+  ├── pool.nim            Stock MixNodePool that holds the nodes a host adds
   ├── spam_protection.nim Pluggable spam-protection abstract base
   ├── delay_strategy.nim  Per-hop delay strategies
   ├── timedcache.nim      Replay-cache primitive (vendored from libp2p pubsub)
@@ -82,15 +83,17 @@ let mixNodeInfo = initMixNodeInfo(
   peerId, multiAddr, mixPubKey, mixPrivKey, libp2pPubKey, libp2pPrivKey
 )
 
-let mix = MixProtocol.new(mixNodeInfo, switch).valueOr:
-  return err("mix init failed: " & error)
+# Mix routes through a MixPool. MixNodePool is the stock one, on the switch
+# peer store. Keep the pool to add nodes to it.
+let pool = MixNodePool.new(switch.peerStore)
+let mix = MixProtocol.new(mixNodeInfo, switch, pool)
 
 # Optional: configure how the exit layer reads payloads for a given proto
 mix.registerDestReadBehavior("/your/proto/1.0.0", readLp(maxSize = -1))
 
-# Optional: bootstrap the node pool
+# Optional: add known mix nodes
 for bootstrapNode in bootstrapNodes:
-  mix.nodePool.add(bootstrapNode)
+  pool.add(bootstrapNode)
 
 # Mount and start
 switch.mount(mix)
