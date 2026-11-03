@@ -117,17 +117,22 @@ proc getConn(
     await mixProto.removeClosedConnections(failed)
   mixProto.connPool.withValue(pid, conn):
     return conn[]
+  if not mixProto.started:
+    raise newException(DialFailedError, "mix protocol is not running")
   var dial = mixProto.dialing.getOrDefault(pid)
   if dial.isNil:
     dial = mixProto.switch.dial(pid, addrs, codecs)
     mixProto.dialing[pid] = dial
-    let started = dial
+    let thisDial = dial
     dial.addCallback(
       proc(_: pointer) {.gcsafe, raises: [].} =
-        if mixProto.dialing.getOrDefault(pid) == started:
+        if mixProto.dialing.getOrDefault(pid) == thisDial:
           mixProto.dialing.del(pid)
-        if started.completed():
-          mixProto.connPool[pid] = started.value
+        if thisDial.completed():
+          if mixProto.started:
+            mixProto.connPool[pid] = thisDial.value
+          else:
+            asyncSpawn thisDial.value.close()
     )
   await dial.join()
   try:
@@ -1220,6 +1225,10 @@ method stop*(mixProto: MixProtocol) {.async: (raises: []).} =
   mixProto.ongoingMixMessages = @[]
   if pending.len > 0:
     await noCancel allFutures(pending.mapIt(it.cancelAndWait()))
+
+  let dials = toSeq(mixProto.dialing.values)
+  if dials.len > 0:
+    await noCancel allFutures(dials.mapIt(it.cancelAndWait()))
 
 proc init*(
     mixProto: MixProtocol,
