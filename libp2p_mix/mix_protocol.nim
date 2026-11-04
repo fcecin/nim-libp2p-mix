@@ -489,6 +489,7 @@ method handleMixMessages*(
       try:
         await mixProto.getConn(nextPeerId, @[nextAddr], @[MixProtocolID])
       except DialFailedError as exc:
+        # A dial that the stop ended is not a failure of the hop.
         if mixProto.started:
           error "Failed to dial next hop: ", err = exc.msg
           mix_messages_error.inc(labelValues = ["Intermediate", "DIAL_FAILED"])
@@ -510,8 +511,10 @@ method handleMixMessages*(
     except CancelledError as exc:
       raise exc
     except DialFailedError as exc:
-      error "Failed to dial next hop: ", err = exc.msg
-      mix_messages_error.inc(labelValues = ["Intermediate", "DIAL_FAILED"])
+      # A dial that the stop ended is not a failure of the hop.
+      if mixProto.started:
+        error "Failed to dial next hop: ", err = exc.msg
+        mix_messages_error.inc(labelValues = ["Intermediate", "DIAL_FAILED"])
     except LPStreamError as exc:
       error "Failed to write to next hop: ", err = exc.msg
       mix_messages_error.inc(labelValues = ["Intermediate", "DIAL_FAILED"])
@@ -776,7 +779,9 @@ proc sendPacket(
     try:
       await mixProto.getConn(peerId, @[multiAddress], @[MixProtocolID])
     except DialFailedError as exc:
-      mix_messages_error.inc(labelValues = [label, "SEND_FAILED"])
+      # A dial that the stop ended is not a failure of the hop.
+      if mixProto.started:
+        mix_messages_error.inc(labelValues = [label, "SEND_FAILED"])
       if proofToken.len > 0:
         mixProto.spamProtection.withValue(sp):
           sp.reclaimProofToken(proofToken)
@@ -796,7 +801,9 @@ proc sendPacket(
       conn, peerId, @[multiAddress], @[MixProtocolID], packetToSend
     )
   except DialFailedError as exc:
-    mix_messages_error.inc(labelValues = [label, "SEND_FAILED"])
+    # A dial that the stop ended is not a failure of the hop.
+    if mixProto.started:
+      mix_messages_error.inc(labelValues = [label, "SEND_FAILED"])
     return err(
       SendPacketError(
         msg: fmt"Failed to redial next hop ({peerId}, {multiAddress}): {exc.msg}"
@@ -1194,7 +1201,9 @@ proc writeCoverPacket(
     mix_messages_forwarded.inc(labelValues = ["Cover"])
     return ok()
   except DialFailedError as exc:
-    mix_messages_error.inc(labelValues = ["Cover", "SEND_FAILED"])
+    # A dial that the stop ended is not a failure of the hop.
+    if mixProto.started:
+      mix_messages_error.inc(labelValues = ["Cover", "SEND_FAILED"])
     return err("Failed to dial for cover packet: " & exc.msg)
   except LPStreamError as exc:
     mix_messages_error.inc(labelValues = ["Cover", "SEND_FAILED"])
