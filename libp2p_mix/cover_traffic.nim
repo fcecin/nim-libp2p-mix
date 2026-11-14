@@ -422,6 +422,18 @@ proc emitCoverPacket*(
       let proofFut = ct.generateAndAppendCoverProof(pkt.packet, claimEpoch)
       defer:
         await cancelAndWait(proofFut, delayFut)
+      # TODO: Evaluate if a refund of a cover packet on a cancel is safe.
+      # A cancel in this hold drops the proof token of the packet and keeps its
+      # slot, and `buildOnDemandOverlapped` does the same. The slot goes back only
+      # with the token, since a packet with no token gets its proof at the send.
+      # try:
+      #   await allFutures(proofFut, delayFut)
+      # except CancelledError as exc:
+      #   if pkt.proofToken.len > 0 and ct.reclaimProofToken != nil:
+      #     ct.reclaimProofToken(pkt.proofToken)
+      #     if not ct.heldAcrossEpochBoundary(claimEpoch):
+      #       ct.unclaimCoverSlot()
+      #   raise exc
       await allFutures(proofFut, delayFut)
 
       if ct.heldAcrossEpochBoundary(claimEpoch):
