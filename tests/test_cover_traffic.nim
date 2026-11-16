@@ -653,6 +653,7 @@ proc pendingBeforeSend(
     precomputation = false,
     builder = mockBuildCoverPacket(),
     generator: GenerateAndAppendCoverProofProc = nil,
+    provider = true,
 ): PendingCover =
   ## The emission waits before its send.
   let
@@ -671,10 +672,11 @@ proc pendingBeforeSend(
       started.fire()
       Delay(60_000)
   )
-  ct.setProofTokenReclaimer(
-    proc(token: seq[byte]) {.gcsafe, raises: [].} =
-      reclaimed[].add(token)
-  )
+  if provider:
+    ct.setProofTokenReclaimer(
+      proc(token: seq[byte]) {.gcsafe, raises: [].} =
+        reclaimed[].add(token)
+    )
   ct.onEpochChange(1)
   PendingCover(ct: ct, started: started, reclaimed: reclaimed, sent: sent)
 
@@ -788,6 +790,19 @@ suite "ConstantRateCoverTraffic cancelled emission":
     await emission.cancelAndWait()
     check:
       cover.reclaimed[] == @[@[0x55.byte]]
+      cover.ct.slotPool.coverClaimed == 0
+      cover.sent[].len == 0
+
+  asyncTest "packet without spam protection cancelled before send returns slot":
+    let cover =
+      pendingBeforeSend(builder = mockBuildCoverPacketNoToken(), provider = false)
+
+    let emission = cover.ct.emitCoverPacket()
+    await cover.started.wait().wait(5.seconds)
+    check cover.ct.slotPool.coverClaimed == 1
+
+    await emission.cancelAndWait()
+    check:
       cover.ct.slotPool.coverClaimed == 0
       cover.sent[].len == 0
 

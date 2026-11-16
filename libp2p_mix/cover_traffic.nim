@@ -332,18 +332,22 @@ proc refundCancelledCover(
 ) {.async: (raises: []).} =
   ## Refund a cover packet that was cancelled before its send. A proof can still
   ## finish after the cancel, so this procedure cancels the proof generation and
-  ## waits for it to end. The slot goes back only with a token, from the build or
-  ## from the proof, because a proof with no token may have used a message ID.
+  ## waits for it to end. The slot goes back with a token, from the build or from
+  ## the proof, or when no provider can take a message ID. With a provider, a
+  ## packet with no token keeps its slot, because its proof may have used one.
+  ## The node has no provider when it has no token reclaimer.
   await proofGen.cancelAndWait()
   var proofToken: seq[byte]
   if proofGen.completed():
     let proved = proofGen.value()
     if proved.isOk:
       proofToken = proved.get().proofToken
-  if (buildToken.len > 0 or proofToken.len > 0) and ct.reclaimProofToken != nil:
-    for token in [buildToken, proofToken]:
-      if token.len > 0:
-        ct.reclaimProofToken(token)
+  let noProvider = ct.reclaimProofToken == nil
+  if buildToken.len > 0 or proofToken.len > 0 or noProvider:
+    if not noProvider:
+      for token in [buildToken, proofToken]:
+        if token.len > 0:
+          ct.reclaimProofToken(token)
     if ct.slotPool.epoch == claimEpoch:
       ct.unclaimCoverSlot()
 
