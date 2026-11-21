@@ -3,7 +3,7 @@
 
 {.used.}
 
-import std/tables
+import std/[strutils, tables]
 import chronos, metrics, results, strformat
 import
   libp2p/
@@ -18,22 +18,35 @@ import libp2p_mix/mix_metrics
 import ./tools/crypto
 import ./[mock_mix, spam_protection_impl]
 
+type TestTransport* {.pure.} = enum
+  ## The transport and the muxer of a test switch.
+  TcpMplex
+  TcpYamux
+  Quic
+
 proc createSwitch*(
     multiAddr: MultiAddress = MultiAddress.init("/ip4/0.0.0.0/tcp/0").tryGet(),
     libp2pPrivKey: Opt[SkPrivateKey] = Opt.none(SkPrivateKey),
+    transport = TestTransport.TcpMplex,
 ): Switch =
   let privKey = PrivateKey(
     scheme: Secp256k1, skkey: libp2pPrivKey.valueOr(SkKeyPair.random(rng()).seckey)
   )
-  return SwitchBuilder
-    .new()
-    .withRng(rng())
-    .withPrivateKey(privKey)
-    .withAddress(multiAddr)
-    .withTcpTransport()
-    .withMplex()
-    .withNoise()
-    .build()
+  let builder =
+    SwitchBuilder.new().withRng(rng()).withPrivateKey(privKey).withAddress(multiAddr)
+  case transport
+  of TestTransport.TcpMplex:
+    builder.withTcpTransport().withMplex().withNoise().build()
+  of TestTransport.TcpYamux:
+    builder.withTcpTransport().withYamux().withNoise().build()
+  of TestTransport.Quic:
+    builder.withQuicTransport().build()
+
+proc quicAddress(tcpAddr: MultiAddress): MultiAddress =
+  ## The QUIC-v1 address on loopback with the port of `tcpAddr`.
+  let text =
+    ($tcpAddr).replace("/ip4/0.0.0.0/", "/ip4/127.0.0.1/").replace("/tcp/", "/udp/")
+  MultiAddress.init(text & "/quic-v1").tryGet()
 
 proc setupMixNode[T: MixProtocol](
     mixNodeInfo: MixNodeInfo,
@@ -80,12 +93,17 @@ proc setupMixNodes*(
     delayStrategy = Opt.none(DelayStrategy),
     hopBackoff: Duration = DefaultHopBackoff,
     hopAddressPolicy: PeerAddressPolicy = defaultAddressPolicy,
+    transport = TestTransport.TcpMplex,
 ): Future[seq[MixProtocol]] {.async.} =
   var nodes: seq[MixProtocol] = @[]
-  let nodeInfos = MixNodeInfo.generateRandomMany(numNodes, rng())
+  var nodeInfos = MixNodeInfo.generateRandomMany(numNodes, rng())
+  if transport == TestTransport.Quic:
+    for info in nodeInfos.mitems:
+      info.multiAddr = quicAddress(info.multiAddr)
   for mixNodeInfo in nodeInfos:
-    let switch =
-      createSwitch(mixNodeInfo.multiAddr, Opt.some(mixNodeInfo.libp2pPrivKey))
+    let switch = createSwitch(
+      mixNodeInfo.multiAddr, Opt.some(mixNodeInfo.libp2pPrivKey), transport
+    )
     let mixNode = setupMixNode[MixProtocol](
       mixNodeInfo, switch, destReadBehavior, spamProtectionRateLimit, delayStrategy,
       hopBackoff, hopAddressPolicy,

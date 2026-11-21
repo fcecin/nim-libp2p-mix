@@ -113,6 +113,9 @@ type
     ongoingLocalSends: Table[uint64, FutureBase]
       ## In-flight local sends, cancelled on stop.
     nextLocalSendId: uint64
+    generation: uint64
+      ## `stop` adds 1 to it. A send reads it when it starts. A send with an
+      ## older value belongs to a run that stopped, so it does not dial or write.
 
 proc registerMixDeliveryHandler*(
     mixProto: MixProtocol, service: string, handler: MixDeliveryHandler
@@ -231,6 +234,11 @@ proc backOffHop(mixProto: MixProtocol, peerId: PeerId, failure: ref DialFailedEr
     mixProto.backedOffUntil.del(backedOff)
   mixProto.backedOffUntil[peerId] = now + mixProto.hopBackoff
 
+func isCurrent(mixProto: MixProtocol, generation: uint64): bool =
+  ## True when a send that read `generation` at its start can still dial and
+  ## write: no stop came after its start, and the protocol runs.
+  generation == mixProto.generation and mixProto.started
+
 proc removeClosedConnections(
     mixProto: MixProtocol, failed: Connection
 ) {.async: (raises: []).} =
@@ -293,16 +301,18 @@ proc getConn(
     pid: PeerId,
     addrs: seq[MultiAddress],
     codecs: seq[string],
+    generation: uint64,
     failed: Connection = nil,
 ): Future[Connection] {.async: (raises: [DialFailedError, CancelledError]).} =
   ## Return the cached stream to `pid`, or the result of the one dial in flight.
   ## `failed` is a cached stream whose write failed. It is closed and replaced.
+  ## `generation` is the `generation` of the protocol when the send started.
   if not failed.isNil:
     await mixProto.removeClosedConnections(failed)
+  if not mixProto.isCurrent(generation):
+    raise newException(DialFailedError, "mix protocol stopped")
   mixProto.connPool.withValue(pid, conn):
     return conn[]
-  if not mixProto.started:
-    raise newException(DialFailedError, "mix protocol is not running")
   let inFlight = mixProto.dialing.getOrDefault(pid)
   let dialOfOtherAddrs = not inFlight.dial.isNil and inFlight.addrs != addrs
   let dial =
@@ -315,7 +325,7 @@ proc getConn(
     # Only `stop` cancels a shared dial. A caller cancelled in `join` raises
     # before this line.
     raise newException(DialFailedError, "mix protocol stopped during the dial")
-  if not mixProto.started:
+  if not mixProto.isCurrent(generation):
     # The dial completed after the stop began. The stop closes its stream, so
     # no caller writes to it.
     raise newException(DialFailedError, "mix protocol stopped during the dial")
@@ -331,6 +341,33 @@ proc getConn(
   except FuturePendingError:
     raiseAssert "join returned with the dial still pending"
 
+proc writeFrame(
+    mixProto: MixProtocol,
+    c: Connection,
+    pid: PeerId,
+    payload: seq[byte],
+    generation: uint64,
+) {.async: (raises: [DialFailedError, LPStreamError, CancelledError]).} =
+  ## Write `payload` and its length on `c`, if the send of `generation` is of
+  ## the current run.
+  ## A cancel of the caller does not go down to the muxer. Yamux and QUIC drop
+  ## the rest of a cancelled write, and the next frame on the stream then ends
+  ## the cut frame. So the cancelled caller takes `c` out of the pool and resets
+  ## it while the muxer still has the full write. The write is not cancelled:
+  ## chronos can send a cancelled TCP write from a buffer that it released.
+  if not mixProto.isCurrent(generation):
+    raise newException(DialFailedError, "mix protocol stopped")
+  let write = c.writeLp(payload)
+  try:
+    await write.join()
+  except CancelledError as e:
+    if not write.finished():
+      if mixProto.connPool.getOrDefault(pid) == c:
+        mixProto.connPool.del(pid)
+      await noCancel c.reset()
+    raise e
+  await write
+
 proc writeLpWithRetry(
     mixProto: MixProtocol,
     c: Connection,
@@ -338,13 +375,14 @@ proc writeLpWithRetry(
     addrs: seq[MultiAddress],
     codecs: seq[string],
     payload: seq[byte],
+    generation: uint64,
 ) {.async: (raises: [DialFailedError, LPStreamError, CancelledError]).} =
   try:
-    await c.writeLp(payload)
+    await mixProto.writeFrame(c, pid, payload, generation)
   except LPStreamClosedError, LPStreamResetError, LPStreamRemoteClosedError,
       LPStreamConnDownError:
-    let replacement = await mixProto.getConn(pid, addrs, codecs, failed = c)
-    await replacement.writeLp(payload)
+    let replacement = await mixProto.getConn(pid, addrs, codecs, generation, failed = c)
+    await mixProto.writeFrame(replacement, pid, payload, generation)
 
 proc writeLp(
     mixProto: MixProtocol,
@@ -352,9 +390,10 @@ proc writeLp(
     addrs: seq[MultiAddress],
     codecs: seq[string],
     payload: seq[byte],
+    generation: uint64,
 ) {.async: (raises: [DialFailedError, LPStreamError, CancelledError]).} =
-  let c = await mixProto.getConn(pid, addrs, codecs)
-  await mixProto.writeLpWithRetry(c, pid, addrs, codecs, payload)
+  let c = await mixProto.getConn(pid, addrs, codecs, generation)
+  await mixProto.writeLpWithRetry(c, pid, addrs, codecs, payload, generation)
 
 proc generateAndAppendProof(
     mixProto: MixProtocol,
@@ -583,6 +622,7 @@ method handleMixMessages*(
     receivedBytes: sink seq[byte],
     metadataBytes: sink seq[byte],
 ) {.base, async: (raises: [LPStreamError, CancelledError]).} =
+  let generation = mixProto.generation
   when defined(enable_mix_benchmarks):
     let startTime = getTime()
 
@@ -821,10 +861,10 @@ method handleMixMessages*(
     # would be an RLN double-signal.
     let conn =
       try:
-        await mixProto.getConn(nextPeerId, @[nextAddr], @[MixProtocolID])
+        await mixProto.getConn(nextPeerId, @[nextAddr], @[MixProtocolID], generation)
       except DialFailedError as exc:
         # A dial that the stop ended is not a failure of the hop.
-        if mixProto.started:
+        if mixProto.isCurrent(generation):
           error "Failed to dial next hop: ", err = exc.msg
           mix_messages_error.inc(labelValues = ["Intermediate", "DIAL_FAILED"])
         mixProto.refundUnwritten(claimEpoch, proofToken)
@@ -832,21 +872,24 @@ method handleMixMessages*(
       except CancelledError as e:
         mixProto.refundUnwritten(claimEpoch, proofToken)
         raise e
+    if not mixProto.isCurrent(generation):
+      mixProto.refundUnwritten(claimEpoch, proofToken)
+      return
 
     try:
       when defined(enable_mix_benchmarks):
         await mixProto.writeLpWithRetry(
-          conn, nextPeerId, @[nextAddr], @[MixProtocolID], metadataBytes
+          conn, nextPeerId, @[nextAddr], @[MixProtocolID], metadataBytes, generation
         )
       await mixProto.writeLpWithRetry(
-        conn, nextPeerId, @[nextAddr], @[MixProtocolID], outgoingPacket
+        conn, nextPeerId, @[nextAddr], @[MixProtocolID], outgoingPacket, generation
       )
       mix_messages_forwarded.inc(labelValues = ["Intermediate"])
     except CancelledError as exc:
       raise exc
     except DialFailedError as exc:
       # A dial that the stop ended is not a failure of the hop.
-      if mixProto.started:
+      if mixProto.isCurrent(generation):
         error "Failed to dial next hop: ", err = exc.msg
         mix_messages_error.inc(labelValues = ["Intermediate", "DIAL_FAILED"])
     except LPStreamError as exc:
@@ -1138,6 +1181,7 @@ proc sendPacket(
   ##
   ## `claimEpoch` is the epoch of the caller's slot claim. The slot is refunded
   ## if nothing was written.
+  let generation = mixProto.generation
 
   let label = $logConfig.logType
   let serialized = sphinxPacket.serialize()
@@ -1198,10 +1242,10 @@ proc sendPacket(
   # so the proof stays spent, including when a retry's redial fails.
   let conn =
     try:
-      await mixProto.getConn(peerId, @[multiAddress], @[MixProtocolID])
+      await mixProto.getConn(peerId, @[multiAddress], @[MixProtocolID], generation)
     except DialFailedError as exc:
       # A dial that the stop ended is not a failure of the hop.
-      if mixProto.started:
+      if mixProto.isCurrent(generation):
         mix_messages_error.inc(labelValues = [label, "SEND_FAILED"])
         if ownFirstHop:
           mixProto.backOffHop(peerId, exc)
@@ -1210,18 +1254,26 @@ proc sendPacket(
     except CancelledError as e:
       mixProto.refundUnwritten(claimEpoch, proofToken)
       raise e
+  if not mixProto.isCurrent(generation):
+    mixProto.refundUnwritten(claimEpoch, proofToken)
+    return err("mix protocol stopped")
 
   try:
     when defined(enable_mix_benchmarks):
       await mixProto.writeLpWithRetry(
-        conn, peerId, @[multiAddress], @[MixProtocolID], logConfig.metadata.serialize()
+        conn,
+        peerId,
+        @[multiAddress],
+        @[MixProtocolID],
+        logConfig.metadata.serialize(),
+        generation,
       )
     await mixProto.writeLpWithRetry(
-      conn, peerId, @[multiAddress], @[MixProtocolID], packetToSend
+      conn, peerId, @[multiAddress], @[MixProtocolID], packetToSend, generation
     )
   except DialFailedError as exc:
     # A dial that the stop ended is not a failure of the hop.
-    if mixProto.started:
+    if mixProto.isCurrent(generation):
       mix_messages_error.inc(labelValues = [label, "SEND_FAILED"])
       if ownFirstHop:
         mixProto.backOffHop(peerId, exc)
@@ -1714,15 +1766,19 @@ proc generateAndAppendCoverProof(
   return ok(CoverProofResult(packet: packet))
 
 proc writeCoverPacket(
-    mixProto: MixProtocol, peerId: PeerId, multiAddr: MultiAddress, packet: seq[byte]
+    mixProto: MixProtocol,
+    peerId: PeerId,
+    multiAddr: MultiAddress,
+    packet: seq[byte],
+    generation: uint64,
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
   try:
-    await mixProto.writeLp(peerId, @[multiAddr], @[MixProtocolID], packet)
+    await mixProto.writeLp(peerId, @[multiAddr], @[MixProtocolID], packet, generation)
     mix_messages_forwarded.inc(labelValues = ["Cover"])
     return ok()
   except DialFailedError as exc:
     # A dial that the stop ended is not a failure of the hop.
-    if mixProto.started:
+    if mixProto.isCurrent(generation):
       mix_messages_error.inc(labelValues = ["Cover", "SEND_FAILED"])
       mixProto.backOffHop(peerId, exc)
     return err("Failed to dial for cover packet: " & exc.msg)
@@ -1739,9 +1795,10 @@ proc sendCoverPacket*(
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
   if not mixProto.started:
     return err("sendCoverPacket: mix protocol is not running")
+  let generation = mixProto.generation
   let proved = (await mixProto.generateAndAppendCoverProof(packet, epoch)).valueOr:
     return err(error)
-  return await mixProto.writeCoverPacket(peerId, multiAddr, proved.packet)
+  return await mixProto.writeCoverPacket(peerId, multiAddr, proved.packet, generation)
 
 method start*(mixProto: MixProtocol) {.async: (raises: [CancelledError]).} =
   await procCall LPProtocol(mixProto).start()
@@ -1758,15 +1815,20 @@ method stop*(mixProto: MixProtocol) {.async: (raises: []).} =
   ## Stop the cover traffic, cancel the hop dials, the pending sends and the
   ## in-flight handleMixMessages futures, close the hop streams, then stop the
   ## `mix_pool_size` timer and the stores.
-  if mixProto.coverTraffic.isSome:
-    await mixProto.coverTraffic.get().stop()
+  # A send that started before this point has an older `generation`. A send
+  # that starts after it sees `started` false. These go before the first
+  # `await`, and so does the list of the dials: a dial that ends in the cover
+  # stop puts no stream in the pool, so the stop must close its stream.
+  mixProto.generation.inc()
   mixProto.started = false
-
-  # The dials go first. A send that waits on its first dial then ends on its
-  # dial failure path, which refunds its slot and its proof.
   # An entry of `dialing` is the future of a dial and the addresses of that dial.
   # The mapIt takes the futures, and the stop cancels them below.
   let dials = toSeq(mixProto.dialing.values).mapIt(it.dial)
+  if mixProto.coverTraffic.isSome:
+    await mixProto.coverTraffic.get().stop()
+
+  # The dials go first. A send that waits on its first dial then ends on its
+  # dial failure path, which refunds its slot and its proof.
   if dials.len > 0:
     await noCancel allFutures(dials.mapIt(it.cancelAndWait()))
   for dial in dials:
@@ -1928,7 +1990,9 @@ proc init*(
       proc(
           peerId: PeerId, multiAddr: MultiAddress, packet: seq[byte], _: uint64
       ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
-        return await mixProto.writeCoverPacket(peerId, multiAddr, packet)
+        return await mixProto.writeCoverPacket(
+          peerId, multiAddr, packet, mixProto.generation
+        )
     )
     ct.setSendDelaySampler(
       proc(): Delay {.gcsafe, raises: [].} =
