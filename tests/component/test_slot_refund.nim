@@ -116,9 +116,9 @@ suite "Slot refund - SURB reply":
     check ct.slotPool.nonCoverClaimed == 0
     check spam[^1].reclaimCount == reclaimedBefore + 1
 
-  asyncTest "failure after a write attempt keeps the slot and the proof spent":
-    ## The next hop may hold a packet whose write reported an error, so
-    ## reissuing its messageId would risk an RLN double-signal.
+  asyncTest "reply over a stream that the next hop closed refunds the slot and the proof":
+    ## A send does not write to a stream that its next hop closed. It dials
+    ## again, so a failed dial refunds the packet.
     let (nodes, spam) = setupCountingNodes(10)
     let (surb, conn) = await nodes.requestSurb()
     defer:
@@ -126,15 +126,20 @@ suite "Slot refund - SURB reply":
       await stopNodes(nodes)
     let ct = nodes[^1].attachCover()
 
-    # A successful reply caches the connection, so the next send writes to it
+    # A successful reply caches a stream to the first hop. The first hop then
+    # stops, and the replying node sees the end of that stream.
     check (await nodes[^1].sendSurbReply(surb, ReplyPayload)).isOk
-    await nodes.firstHop(surb).switch.stop()
-    await sleepAsync(300.milliseconds)
+    let firstHop = nodes.firstHop(surb)
+    let cached = nodes[^1].connPool.getOrDefault(firstHop.switch.peerInfo.peerId)
+    check not cached.isNil
+    await firstHop.switch.stop()
+    checkUntilTimeout:
+      cached.atEof or cached.closed
     let reclaimedBefore = spam[^1].reclaimCount
 
     check (await nodes[^1].sendSurbReply(surb, ReplyPayload)).isErr
-    check ct.slotPool.nonCoverClaimed == 2
-    check spam[^1].reclaimCount == reclaimedBefore
+    check ct.slotPool.nonCoverClaimed == 1
+    check spam[^1].reclaimCount == reclaimedBefore + 1
 
   asyncTest "failed reply claimed in an earlier epoch leaves the new epoch alone":
     let (nodes, _) = setupCountingNodes(10)
@@ -186,7 +191,10 @@ suite "Slot refund - forward":
     # The first hop's forward went out; the second hop's dial failed
     check hops.mapIt(it.slotPool.nonCoverClaimed).foldl(a + b) == 1
 
-  asyncTest "failure after a write attempt keeps the slot and the proof spent":
+  asyncTest "forward over a stream that the next hop closed refunds the slot and the proof":
+    ## The last relay does not write to its stream that the exit closed. Its
+    ## dial of the exit fails, so its packet gets a refund. The first relay
+    ## keeps the slot and the proof of its forward.
     let (nodes, spam) = setupCountingNodes(5)
     await startNodes(nodes)
     defer:
@@ -218,8 +226,8 @@ suite "Slot refund - forward":
       spam[1 .. 3].mapIt(it.generateCount).foldl(a + b) == 2
       nodes[1 .. 3].allIt(it.ongoingMixMessages.len == 0)
 
-    check hops.mapIt(it.slotPool.nonCoverClaimed).foldl(a + b) == 2
-    check spam[1 .. 3].mapIt(it.reclaimCount).foldl(a + b) == 0
+    check hops.mapIt(it.slotPool.nonCoverClaimed).foldl(a + b) == 1
+    check spam[1 .. 3].mapIt(it.reclaimCount).foldl(a + b) == 1
 
 suite "Slot refund - local send":
   asyncTeardown:
@@ -607,9 +615,9 @@ suite "Slot refund - packet stages":
       spam[0].reclaimed == @[@[2.byte]]
     await kept.cancelAndWait()
 
-  asyncTest "send cancelled in write keeps slot and proof":
-    ## The first hop may have a packet whose write failed, so a cancel in the
-    ## redial that follows refunds nothing.
+  asyncTest "send cancelled in redial of a closed stream refunds slot and reclaims proof":
+    ## A send does not write to a stream that its next hop closed, so a cancel
+    ## in the dial that replaces the stream refunds the packet.
     let (nodes, spam, _) = setupNodes(5)
     startAndDeferStop(nodes)
     let server = HoldingServer.new()
@@ -626,6 +634,32 @@ suite "Slot refund - packet stages":
 
     await send.cancelAndWait()
     check:
+      ct.slotPool.nonCoverClaimed == 0
+      spam[0].reclaimCount == 1
+
+  asyncTest "send cancelled in retry after failed write keeps slot and proof":
+    ## The first hop may have a part of the packet whose write failed, so a
+    ## cancel in the retry refunds nothing.
+    let (nodes, spam, _) = setupNodes(5)
+    startAndDeferStop(nodes)
+    let dialer = await nodes[0].holdHopStreams(nodes[1 .. 3])
+    dialer.holdWrites = true
+    let ct = nodes[0].attachCover()
+
+    let send = nodes.sendToLast()
+    checkUntilTimeout:
+      dialer.firstHeld()
+    let held = dialer.streams[0]
+
+    # The write fails, and the retry waits for the reset of the failed stream.
+    held.closing = Future[void].Raising([CancelledError]).init("HoldingStream.closing")
+    held.failWrites(newLPStreamResetError())
+    checkUntilTimeout:
+      held.isClosed
+    send.cancelSoon()
+    check await send.join().withTimeout(1.seconds)
+    held.closing.complete()
+    check:
       ct.slotPool.nonCoverClaimed == 1
       spam[0].reclaimCount == 0
 
@@ -639,6 +673,199 @@ suite "Slot refund - packet stages":
       (await nodes.sendToLast()).isErr
       ct.slotPool.nonCoverClaimed == 1
       spam[0].reclaimCount == 0
+
+  asyncTest "reply with failed write keeps slot and proof":
+    let (nodes, spam, _) = setupNodes(5)
+    startAndDeferStop(nodes)
+    let exitPeerId = nodes[^1].switch.peerInfo.peerId
+    let surb = nodes[0]
+      .buildSurb(rng().generate(SURBIdentifier), exitPeerId, exitPeerId)
+      .expect("SURB").surb
+    nodes[^1].failWrites()
+    let ct = nodes[^1].attachCover()
+
+    check:
+      (await nodes[^1].sendSurbReply(surb, ReplyPayload)).isErr
+      ct.slotPool.nonCoverClaimed == 1
+      spam[^1].reclaimCount == 0
+
+  asyncTest "send cancelled behind held write refunds slot and reclaims proof":
+    let (nodes, spam, _) = setupNodes(5)
+    startAndDeferStop(nodes)
+    let dialer = await nodes[0].holdHopStreams(nodes[1 .. 3])
+    dialer.holdWrites = true
+    # A held cover write to each middle node makes the send wait behind one of
+    # them, at any first hop.
+    let covers = nodes[1 .. 3].mapIt(
+      nodes[0].sendCoverPacket(it.peerId, it.switch.peerInfo.addrs[0], @[1.byte])
+    )
+    checkUntilTimeout:
+      dialer.streams.len == 3
+      dialer.streams.allIt(it.pendingWrites.len == 1)
+    let ct = nodes[0].attachCover()
+
+    let send = nodes.sendToLast()
+    checkUntilTimeout:
+      dialer.streams.anyIt(nodes[0].waitingWrites(it) == 1)
+    check ct.slotPool.nonCoverClaimed == 1
+
+    await send.cancelAndWait()
+    check:
+      ct.slotPool.nonCoverClaimed == 0
+      spam[0].reclaimCount == 1
+      dialer.streams.allIt(it.pendingWrites.len == 1)
+
+    for stream in dialer.streams:
+      stream.release()
+    await allFutures(covers).wait(2.seconds)
+    check dialer.streams.allIt(it.written.len == 1)
+
+  asyncTest "send cancelled as its turn comes writes its packet and keeps slot and proof":
+    let (nodes, spam, _) = setupNodes(5)
+    startAndDeferStop(nodes)
+    let dialer = await nodes[0].holdHopStreams(nodes[1 .. 3])
+    dialer.holdWrites = true
+    let heldCovers = nodes[1 .. 3].mapIt(
+      nodes[0].sendCoverPacket(it.peerId, it.switch.peerInfo.addrs[0], @[1.byte])
+    )
+    checkUntilTimeout:
+      dialer.streams.len == 3
+      dialer.streams.allIt(it.pendingWrites.len == 1)
+    let ct = nodes[0].attachCover()
+
+    let send = nodes.sendToLast()
+    checkUntilTimeout:
+      dialer.streams.anyIt(nodes[0].waitingWrites(it) == 1)
+    let held = dialer.streams.filterIt(nodes[0].waitingWrites(it) == 1)[0]
+
+    # The cancel comes in the turn where the write before the send ends. The
+    # send gets the stream first, and the cancel then stops only its wait.
+    nodes[0].hopWrites[Connection(held)].addCallback(
+      proc(_: pointer) {.gcsafe, raises: [].} =
+        send.cancelSoon()
+    )
+    held.release()
+    check await send.join().withTimeout(2.seconds)
+    check:
+      send.cancelled
+      held.pendingWrites.len == 1
+      ct.slotPool.nonCoverClaimed == 1
+      spam[0].reclaimCount == 0
+
+    held.release()
+    checkUntilTimeout:
+      held.written.len == 2
+    check heldCovers.allIt(not it.failed)
+
+  asyncTest "send cancelled in held write keeps slot and proof":
+    let (nodes, spam, _) = setupNodes(5)
+    startAndDeferStop(nodes)
+    let dialer = await nodes[0].holdHopStreams(nodes[1 .. 3])
+    dialer.holdWrites = true
+    let ct = nodes[0].attachCover()
+
+    let send = nodes.sendToLast()
+    checkUntilTimeout:
+      dialer.firstHeld()
+    check ct.slotPool.nonCoverClaimed == 1
+
+    await send.cancelAndWait()
+    check:
+      ct.slotPool.nonCoverClaimed == 1
+      spam[0].reclaimCount == 0
+
+    let held = dialer.streams[0]
+    held.release()
+    checkUntilTimeout:
+      held.written.len == 1
+
+  asyncTest "forward stopped in held write keeps slot and proof":
+    let (nodes, spam, _) = setupNodes(5)
+    startAndDeferStop(nodes)
+    let covers = nodes[1 .. 3].mapIt(it.attachCover())
+    var dialers: seq[HoldingDialer]
+    for hop in nodes[1 .. 3]:
+      let dialer = await hop.holdHopStreams(nodes[1 ..^ 1].filterIt(it != hop))
+      dialer.holdWrites = true
+      dialers.add(dialer)
+
+    check (await nodes.sendToLast()).isOk
+    checkUntilTimeout:
+      dialers.anyIt(it.firstHeld())
+    check covers.mapIt(it.slotPool.nonCoverClaimed).foldl(a + b) == 1
+
+    for hop in nodes[1 .. 3]:
+      let stopping = hop.stop()
+      check await stopping.join().withTimeout(2.seconds)
+    check:
+      covers.mapIt(it.slotPool.nonCoverClaimed).foldl(a + b) == 1
+      spam[1 .. 3].mapIt(it.reclaimCount).foldl(a + b) == 0
+      dialers.anyIt(it.streams.anyIt(it.cancelledWrites == 1 and it.isClosed))
+
+  asyncTest "forward cancelled in held write finishes its packet and keeps slot and proof":
+    let (nodes, spam, _) = setupNodes(5)
+    startAndDeferStop(nodes)
+    let covers = nodes[1 .. 3].mapIt(it.attachCover())
+    var dialers: seq[HoldingDialer]
+    for hop in nodes[1 .. 3]:
+      let dialer = await hop.holdHopStreams(nodes[1 ..^ 1].filterIt(it != hop))
+      dialer.holdWrites = true
+      dialers.add(dialer)
+
+    check (await nodes.sendToLast()).isOk
+    checkUntilTimeout:
+      dialers.anyIt(it.firstHeld())
+    let index = toSeq(0 ..< dialers.len).filterIt(dialers[it].firstHeld())[0]
+    let relay = nodes[1 + index]
+    let held = dialers[index].streams[0]
+
+    # The relay keeps running, and only the task of the forward ends.
+    for handler in relay.ongoingMixMessages.values:
+      handler.cancelSoon()
+    checkUntilTimeout:
+      relay.ongoingMixMessages.len == 0
+    check held.pendingWrites.len == 1
+
+    held.release()
+    checkUntilTimeout:
+      held.written.len == 1
+    check:
+      held.cancelledWrites == 0
+      covers.mapIt(it.slotPool.nonCoverClaimed).foldl(a + b) == 1
+      spam[1 .. 3].mapIt(it.reclaimCount).foldl(a + b) == 0
+
+  asyncTest "send at stalled stream refunds slot and reclaims proof":
+    let (nodes, spam, _) = setupNodes(5)
+    startAndDeferStop(nodes)
+    let dialer = await nodes[0].holdHopStreams(nodes[1 .. 3])
+    dialer.holdWrites = true
+    # Each middle node gets a held cover write and a full line of writes behind
+    # it, so the send finds a stalled stream at any first hop.
+    let heldCovers = nodes[1 .. 3].mapIt(
+      nodes[0].sendCoverPacket(it.peerId, it.switch.peerInfo.addrs[0], @[1.byte])
+    )
+    checkUntilTimeout:
+      dialer.streams.len == 3
+      dialer.streams.allIt(it.pendingWrites.len == 1)
+    # The length prefix of a 4096-byte packet takes 2 bytes.
+    let packet = newSeq[byte](4096)
+    let fit = WaitingBytesLimit div (packet.len + 2)
+    var waiting: seq[typeof(heldCovers[0])]
+    for hop in nodes[1 .. 3]:
+      for _ in 1 .. fit:
+        waiting.add(
+          nodes[0].sendCoverPacket(hop.peerId, hop.switch.peerInfo.addrs[0], packet)
+        )
+    check dialer.streams.allIt(nodes[0].waitingWrites(it) == fit)
+    for stream in dialer.streams:
+      nodes[0].ageHopGate(stream)
+    let ct = nodes[0].attachCover()
+
+    let sent = await nodes.sendToLast().wait(5.seconds)
+    check:
+      sent.isErr
+      ct.slotPool.nonCoverClaimed == 0
+      spam[0].reclaimCount == 1
 
   asyncTest "reply cancelled in wait refunds slot and reclaims proof":
     let (nodes, spam, delays) = setupNodes(5)
@@ -807,7 +1034,7 @@ suite "Slot refund - packet stages":
       covers.mapIt(it.slotPool.nonCoverClaimed).foldl(a + b) == 0
       spam[1 .. 3].mapIt(it.reclaimCount).foldl(a + b) == 1
 
-  asyncTest "forward stopped in write keeps slot and proof":
+  asyncTest "forward stopped in redial of a closed stream refunds slot and reclaims proof":
     let (nodes, spam, _) = setupNodes(5)
     startAndDeferStop(nodes)
     let server = HoldingServer.new()
@@ -823,6 +1050,38 @@ suite "Slot refund - packet stages":
 
     for hop in nodes[1 .. 3]:
       await hop.stop()
+    check:
+      covers.mapIt(it.slotPool.nonCoverClaimed).foldl(a + b) == 0
+      spam[1 .. 3].mapIt(it.reclaimCount).foldl(a + b) == 1
+
+  asyncTest "forward stopped in retry after failed write keeps slot and proof":
+    let (nodes, spam, _) = setupNodes(5)
+    startAndDeferStop(nodes)
+    let covers = nodes[1 .. 3].mapIt(it.attachCover())
+    var dialers: seq[HoldingDialer]
+    for hop in nodes[1 .. 3]:
+      let dialer = await hop.holdHopStreams(nodes[1 ..^ 1].filterIt(it != hop))
+      dialer.holdWrites = true
+      dialers.add(dialer)
+
+    check (await nodes.sendToLast()).isOk
+    checkUntilTimeout:
+      dialers.anyIt(it.firstHeld())
+    let held = dialers.filterIt(it.firstHeld())[0].streams[0]
+
+    # The write fails, and the retry waits for the reset of the failed stream.
+    held.closing = Future[void].Raising([CancelledError]).init("HoldingStream.closing")
+    held.failWrites(newLPStreamResetError())
+    checkUntilTimeout:
+      held.isClosed
+
+    # The stop cancels the forward in that wait, and then it waits for the reset.
+    let stops = nodes[1 .. 3].mapIt(it.stop())
+    checkUntilTimeout:
+      nodes[1 .. 3].allIt(it.ongoingMixMessages.len == 0)
+    held.closing.complete()
+    for stopping in stops:
+      check await stopping.join().withTimeout(2.seconds)
     check:
       covers.mapIt(it.slotPool.nonCoverClaimed).foldl(a + b) == 1
       spam[1 .. 3].mapIt(it.reclaimCount).foldl(a + b) == 0

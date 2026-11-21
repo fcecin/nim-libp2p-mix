@@ -178,9 +178,9 @@ suite "Hop backoff":
     let coverSelected = await nodes[0].coverSelects(hop.peerId, 100)
     check coverSelected
 
-  asyncTest "a first hop whose redial fails is backed off":
-    # A send writes to the cached stream of its first hop.
-    # It dials again when that stream is broken.
+  asyncTest "a first hop whose cached stream closed and whose dial fails is backed off":
+    # A send does not write to a cached stream that its first hop closed.
+    # It dials again, and the failure of that dial backs the hop off.
     let nodes = await setupMixNodes(6)
     await startNodes(nodes)
     defer:
@@ -192,10 +192,38 @@ suite "Hop backoff":
     await nodes[4].switch.stop()
     checkUntilTimeout:
       not nodes[0].switch.isConnected(hop.peerId)
-    let redial = await nodes[0].sendUntilFirstHopFails(nodes[5], 40, RedialFailed)
+    let redial = await nodes[0].sendUntilFirstHopFails(nodes[5], 40, DialFailed)
     check redial
     let later = await nodes[0].firstHopFailures(nodes[5], 30)
     check later == 0
+
+  asyncTest "a first hop whose write fails and whose redial fails is backed off":
+    # A write that fails on a stream that is not closed gets one retry. The
+    # failure of the dial of that retry backs the hop off.
+    let nodes = await setupMixNodes(6)
+    await startNodes(nodes)
+    defer:
+      await stopNodes(nodes)
+    let dialer = await nodes[0].holdHopStreams(nodes[1 ..^ 1])
+    dialer.holdWrites = true
+    let sending = nodes[0].anonymizeLocalProtocolSend(
+      newAsyncQueue[seq[byte]](),
+      @[1.byte],
+      TestCodec,
+      MixDestination.exitNode(nodes[5].switch.peerInfo.peerId),
+      0,
+    )
+    checkUntilTimeout:
+      dialer.firstHeld()
+    let held = dialer.streams[0]
+    dialer.failDials = true
+    held.failWrites(newLPStreamResetError())
+    let res = await sending.wait(5.seconds)
+    check:
+      res.isErr
+      RedialFailed in res.error
+    let selected = await nodes[0].coverSelects(held.peerId, 100)
+    check not selected
 
   asyncTest "a first hop that refuses the mix protocol on an open connection is backed off":
     # A pool member can hold a connection for another protocol and refuse mix.
@@ -280,7 +308,7 @@ suite "Hop backoff":
     var coverSelected = await nodes[0].coverSelects(hop.peerId, 100)
     check coverSelected
     # A reply that leaves caches a stream to the hop.
-    # The stream then breaks, so the next reply fails its redial.
+    # The stream then closes, so the next reply dials again and fails.
     let sent = await nodes[0].sendSurbReply(makeSurb(path, hop.multiAddr), @[1.byte])
     check sent.isOk
     await nodes[0].switch.disconnect(hop.peerId)
@@ -289,7 +317,7 @@ suite "Hop backoff":
     let redial = await nodes[0].sendSurbReply(wrong, @[1.byte])
     check:
       redial.isErr
-      RedialFailed in redial.error
+      DialFailed in redial.error
     coverSelected = await nodes[0].coverSelects(hop.peerId, 100)
     check coverSelected
 
