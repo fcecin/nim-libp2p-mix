@@ -38,9 +38,57 @@ const PoolSizeUpdateInterval = chronos.seconds(10)
   ## The timer of `mix_pool_size` counts the usable pool members this often, which
   ## is shorter than the usual scrape interval of a metrics server.
 
+const MaxWaitingHopBytes = 256 * 1024
+  ## The bytes of the writes that can wait behind the write in progress on one
+  ## hop stream, as the send queue limit of Yamux. A write that would go past
+  ## it fails before it sends a byte.
+
+const HopStallTimeout = chronos.seconds(10)
+  ## A hop stream whose writes made no progress for this time, while its writes
+  ## that wait are at `MaxWaitingHopBytes`, counts as stalled. The protocol then
+  ## closes the connection under the stream, the write in progress ends, and the
+  ## writes that wait fail before they send a byte. On Mplex a stalled stream
+  ## stops the TCP connection under it, so only a new connection recovers.
+
 type
   HopDial = Future[Connection].Raising([DialFailedError, CancelledError])
     ## A dial of a hop, as `switch.dial` returns it.
+
+  HopWrite = Future[void].Raising([CancelledError, LPStreamError])
+    ## One write of the frames of a packet to a hop stream. The protocol keeps
+    ## it, and only the protocol cancels it, at a stop or when it takes the
+    ## stream out of use. A cancel of the sender stops only the wait of the
+    ## sender, so the muxer does not cut the packet. On Mplex the bytes of a
+    ## write that the protocol cancels can still go out.
+
+  StartedWrite = object
+    conn: Connection
+    write: HopWrite
+    run: uint64
+
+  HopGate = ref object
+    ## Lets the writes on one hop stream start one at a time, in the order that
+    ## they come to the gate. A write that does not complete can leave a part
+    ## of a packet on the stream. The gate keeps the next packet out of the
+    ## muxer until the write ends, so the protocol can take the stream out of
+    ## use first. The order holds on one stream. A write that goes to a new
+    ## stream can pass a write that waited before it.
+    lock: AsyncLock
+    waiting: int ## The count of the writes that wait.
+    waitingBytes: int
+    progress: Moment ## The last moment when a write on the stream started or ended.
+    stalled: bool ## True when the stream stalled. The writes that wait for it then fail.
+
+  HopBusyError = object of DialFailedError
+    ## Too many writes wait for the stream of a hop. The write sends no byte.
+
+  HopStalledError = object of DialFailedError
+    ## The stream of a hop stalled. The write sends no byte. A first hop that
+    ## stalls gets a backoff, as for a failed dial.
+
+  MixStoppedError = object of DialFailedError
+    ## The protocol stopped before or during a hop write. It is no failure of
+    ## the hop.
 
   OtherAddressDialError = object of DialFailedError
     ## A caller of `getConn` waited for a dial of another address, and it failed.
@@ -98,6 +146,21 @@ type
       ## The `readHopStream` future of each hop stream, cancelled on stop. Keyed
       ## so removal on completion is O(1).
     nextHopReaderId: uint64
+    hopWrites: Table[Connection, HopWrite]
+      ## The write in progress on each hop stream. A stream has a maximum of one
+      ## write at a time. If a write does not complete, no other packet is in
+      ## the muxer behind its part of a packet.
+    hopGates: Table[Connection, HopGate]
+    hopCleanups: Table[uint64, Future[void]]
+      ## The resets of failed hop streams in progress. `stop` waits for them.
+    nextHopCleanupId: uint64
+    runId: uint64
+      ## The count of the starts after a stop. A hop write that began to wait
+      ## before a stop does not dial or start after the next start.
+    unusableStreams: HashSet[Connection]
+      ## The cached hop streams with a write that did not complete. Such a
+      ## stream can hold a part of a packet. The next write to its peer resets
+      ## it and dials again.
     backedOffUntil: Table[PeerId, Moment]
       ## The moment until which a first hop that failed a dial is not the first hop.
     hopBackoff: Duration
@@ -217,10 +280,15 @@ proc hopIsBackedOff(mixProto: MixProtocol, peerId: PeerId): bool =
   ## It is the one hop this node both selects and dials.
   Moment.now() < mixProto.backedOffUntil.getOrDefault(peerId)
 
+func failedTheHop(mixProto: MixProtocol, failure: ref DialFailedError): bool =
+  ## False for an error that a stop caused. Such an error is not a failure of
+  ## the hop, and it gets no error count.
+  mixProto.started and not (failure of MixStoppedError)
+
 proc backOffHop(mixProto: MixProtocol, peerId: PeerId, failure: ref DialFailedError) =
   ## Record a failed dial of `peerId`, and delete the entries whose backoff ended.
-  ## An `OtherAddressDialError` records nothing.
-  if failure of OtherAddressDialError:
+  ## An `OtherAddressDialError` or a `HopBusyError` records nothing.
+  if failure of OtherAddressDialError or failure of HopBusyError:
     return
   let now = Moment.now()
   var expired: seq[PeerId]
@@ -234,16 +302,34 @@ proc backOffHop(mixProto: MixProtocol, peerId: PeerId, failure: ref DialFailedEr
 proc removeClosedConnections(
     mixProto: MixProtocol, failed: Connection
 ) {.async: (raises: []).} =
-  ## Take `failed` and the streams of disconnected peers out of the pool and
-  ## close them.
+  ## Take `failed` and the streams of disconnected peers out of the pool. Reset
+  ## `failed`, because it can hold a part of a packet, and close the others.
   var stale: seq[tuple[peerId: PeerId, conn: Connection]]
   for peerId, conn in mixProto.connPool:
     if conn == failed or not mixProto.switch.isConnected(peerId):
       stale.add((peerId, conn))
-  for (peerId, _) in stale:
+  for (peerId, conn) in stale:
     mixProto.connPool.del(peerId)
+    mixProto.unusableStreams.excl(conn)
+    mixProto.hopGates.del(conn)
   for (_, conn) in stale:
-    await conn.close()
+    if conn == failed:
+      await conn.reset()
+    else:
+      await conn.close()
+
+proc spawnHopCleanup(mixProto: MixProtocol, failed: Connection): Future[void] =
+  ## Start `removeClosedConnections` for `failed`, track its future in
+  ## `hopCleanups`, and remove it from there when it finishes.
+  let id = mixProto.nextHopCleanupId
+  mixProto.nextHopCleanupId.inc()
+  let fut = mixProto.removeClosedConnections(failed)
+  mixProto.hopCleanups[id] = fut
+  fut.addCallback(
+    proc(_: pointer) {.gcsafe, raises: [].} =
+      mixProto.hopCleanups.del(id)
+  )
+  fut
 
 proc readHopStream(conn: Connection) {.async: (raises: [CancelledError]).} =
   ## Read `conn` until it ends, and discard what it carries.
@@ -270,6 +356,19 @@ proc spawnHopReader(mixProto: MixProtocol, conn: Connection) =
       mixProto.hopReaders.del(id)
   )
 
+proc publishDial(mixProto: MixProtocol, pid: PeerId, dial: HopDial) =
+  ## Take the finished `dial` out of `dialing` and put its stream in the pool,
+  ## one time. A caller of `getConn` can resume before the callback of the dial
+  ## runs, so `getConn` also calls this.
+  if mixProto.dialing.getOrDefault(pid).dial != dial:
+    return
+  mixProto.dialing.del(pid)
+  if dial.completed():
+    mixProto.backedOffUntil.del(pid)
+    if mixProto.started:
+      mixProto.connPool[pid] = dial.value
+      mixProto.spawnHopReader(dial.value)
+
 proc startDial(
     mixProto: MixProtocol, pid: PeerId, addrs: seq[MultiAddress], codecs: seq[string]
 ): HopDial =
@@ -279,30 +378,18 @@ proc startDial(
   mixProto.dialing[pid] = (dial: dial, addrs: addrs)
   dial.addCallback(
     proc(_: pointer) {.gcsafe, raises: [].} =
-      mixProto.dialing.del(pid)
-      if dial.completed():
-        mixProto.backedOffUntil.del(pid)
-        if mixProto.started:
-          mixProto.connPool[pid] = dial.value
-          mixProto.spawnHopReader(dial.value)
+      mixProto.publishDial(pid, dial)
   )
   dial
 
 proc getConn(
-    mixProto: MixProtocol,
-    pid: PeerId,
-    addrs: seq[MultiAddress],
-    codecs: seq[string],
-    failed: Connection = nil,
+    mixProto: MixProtocol, pid: PeerId, addrs: seq[MultiAddress], codecs: seq[string]
 ): Future[Connection] {.async: (raises: [DialFailedError, CancelledError]).} =
   ## Return the cached stream to `pid`, or the result of the one dial in flight.
-  ## `failed` is a cached stream whose write failed. It is closed and replaced.
-  if not failed.isNil:
-    await mixProto.removeClosedConnections(failed)
   mixProto.connPool.withValue(pid, conn):
     return conn[]
   if not mixProto.started:
-    raise newException(DialFailedError, "mix protocol is not running")
+    raise newException(MixStoppedError, "mix protocol is not running")
   let inFlight = mixProto.dialing.getOrDefault(pid)
   let dialOfOtherAddrs = not inFlight.dial.isNil and inFlight.addrs != addrs
   let dial =
@@ -311,14 +398,15 @@ proc getConn(
     else:
       inFlight.dial
   await dial.join()
+  mixProto.publishDial(pid, dial)
   if dial.cancelled():
     # Only `stop` cancels a shared dial. A caller cancelled in `join` raises
     # before this line.
-    raise newException(DialFailedError, "mix protocol stopped during the dial")
+    raise newException(MixStoppedError, "mix protocol stopped during the dial")
   if not mixProto.started:
     # The dial completed after the stop began. The stop closes its stream, so
     # no caller writes to it.
-    raise newException(DialFailedError, "mix protocol stopped during the dial")
+    raise newException(MixStoppedError, "mix protocol stopped during the dial")
   if dial.failed() and dialOfOtherAddrs:
     # A caller waits for one dial at most.
     # So it does not dial its own addresses after this failure.
@@ -331,30 +419,197 @@ proc getConn(
   except FuturePendingError:
     raiseAssert "join returned with the dial still pending"
 
-proc writeLpWithRetry(
-    mixProto: MixProtocol,
-    c: Connection,
-    pid: PeerId,
-    addrs: seq[MultiAddress],
-    codecs: seq[string],
-    payload: seq[byte],
-) {.async: (raises: [DialFailedError, LPStreamError, CancelledError]).} =
-  try:
-    await c.writeLp(payload)
-  except LPStreamClosedError, LPStreamResetError, LPStreamRemoteClosedError,
-      LPStreamConnDownError:
-    let replacement = await mixProto.getConn(pid, addrs, codecs, failed = c)
-    await replacement.writeLp(payload)
+func lpFrame(data: openArray[byte]): seq[byte] =
+  ## `data` after its varint length, as `writeLp` writes it.
+  let prefix = PB.toBytes(data.len.uint64)
+  var frame = newSeqUninit[byte](prefix.len + data.len)
+  frame[0 ..< prefix.len] = prefix.toOpenArray()
+  frame[prefix.len ..< frame.len] = data
+  frame
 
-proc writeLp(
+proc release(gate: HopGate) =
+  try:
+    gate.lock.release()
+  except AsyncLockError:
+    raiseAssert "a hop gate is released only by the write that holds it"
+
+proc writeHopStream(
+    mixProto: MixProtocol,
+    pid: PeerId,
+    conn: Connection,
+    frames: seq[byte],
+    gate: HopGate,
+) {.async: (raises: [CancelledError, LPStreamError]).} =
+  ## Write `frames` to `conn`, a hop stream to `pid`, and then open `gate` for
+  ## the next write. A write that does not complete marks `conn` unusable
+  ## before the next write starts.
+  var completed = false
+  try:
+    await conn.write(frames)
+    if conn.atEof:
+      # The next hop closed the stream. A Mix hop does that only when it stops
+      # reading, and Yamux then completes a write that it sent only in part. So
+      # this write can be incomplete. If it was complete, the retry sends a
+      # second copy, and the replay check of the next hop drops it.
+      raise newLPStreamRemoteClosedError()
+    completed = true
+  finally:
+    gate.progress = Moment.now()
+    mixProto.hopWrites.del(conn)
+    if not completed and mixProto.connPool.getOrDefault(pid) == conn:
+      mixProto.unusableStreams.incl(conn)
+    gate.release()
+
+proc retireHopStream(mixProto: MixProtocol, pid: PeerId, conn: Connection) =
+  ## Take `conn` out of use, so that the next write to `pid` resets it and dials
+  ## a new stream. The write in progress on `conn` ends. On Yamux and QUIC it
+  ## can leave a part of a packet, which is then the last data on the stream.
+  if mixProto.connPool.getOrDefault(pid) == conn:
+    mixProto.unusableStreams.incl(conn)
+  let inProgress = mixProto.hopWrites.getOrDefault(conn)
+  if not inProgress.isNil:
+    inProgress.cancelSoon()
+
+proc startHopWrite(
     mixProto: MixProtocol,
     pid: PeerId,
     addrs: seq[MultiAddress],
     codecs: seq[string],
-    payload: seq[byte],
+    frames: seq[byte],
+    failed: Connection = nil,
+    run = Opt.none(uint64),
+): Future[StartedWrite] {.async: (raises: [DialFailedError, CancelledError]).} =
+  ## Get the stream to `pid` from `getConn`, wait for the writes before this one
+  ## on it, and then start the write of `frames`. `frames` are all the frames of
+  ## one packet. `failed` is a stream to reset first. `run` is the run of the
+  ## first attempt of a retry. An error or a cancel in this procedure writes no
+  ## byte.
+  let run = run.get(mixProto.runId)
+  template stopped(): bool =
+    not mixProto.started or mixProto.runId != run
+
+  template ended(conn: Connection): bool =
+    conn.atEof or conn.closed
+
+  template outOfUse(conn: Connection): bool =
+    conn in mixProto.unusableStreams or ended(conn)
+
+  var
+    toClose = failed
+    conn: Connection = nil
+    replacedEnded = false
+  while true:
+    if stopped():
+      raise newException(MixStoppedError, "mix protocol stopped before the write")
+    if not toClose.isNil:
+      # The reset belongs to the protocol. A cancel stops only this wait.
+      await mixProto.spawnHopCleanup(toClose).join()
+      toClose = nil
+      continue
+    if conn.isNil:
+      conn = await mixProto.getConn(pid, addrs, codecs)
+      continue
+    if outOfUse(conn):
+      # A stream that can hold a part of a packet always goes out of use. A
+      # stream that the next hop closed goes out of use one time for each
+      # write, so a next hop that closes each new stream causes no loop of
+      # dials.
+      if ended(conn) and conn notin mixProto.unusableStreams:
+        if replacedEnded:
+          mixProto.retireHopStream(pid, conn)
+          raise newException(DialFailedError, "the next hop closed a new stream")
+        replacedEnded = true
+      mixProto.retireHopStream(pid, conn)
+      toClose = conn
+      conn = nil
+      continue
+    if mixProto.connPool.getOrDefault(pid) != conn:
+      conn = nil
+      continue
+    var gate = mixProto.hopGates.getOrDefault(conn)
+    if gate.isNil:
+      gate = HopGate(lock: newAsyncLock(), progress: Moment.now())
+      mixProto.hopGates[conn] = gate
+    if gate.waitingBytes + frames.len > MaxWaitingHopBytes and gate.lock.locked():
+      if gate.waitingBytes == 0 or conn notin mixProto.hopWrites or
+          Moment.now() - gate.progress < HopStallTimeout:
+        raise newException(HopBusyError, "too many writes wait for the hop stream")
+      gate.stalled = true
+      # A closed transport drops the bytes that it did not send. So the close
+      # goes before the end of the write, and on Mplex no cancelled write
+      # stays in the queue of the transport.
+      await conn.getWrapped().close()
+      mixProto.retireHopStream(pid, conn)
+      raise newException(HopStalledError, "the hop stream stalled")
+    gate.waiting.inc()
+    gate.waitingBytes.inc(frames.len)
+    try:
+      await gate.lock.acquire()
+    finally:
+      gate.waiting.dec()
+      gate.waitingBytes.dec(frames.len)
+    if stopped():
+      gate.release()
+      raise newException(MixStoppedError, "mix protocol stopped before the write")
+    if gate.stalled:
+      gate.release()
+      raise newException(HopStalledError, "the hop stream stalled")
+    if mixProto.connPool.getOrDefault(pid) != conn or outOfUse(conn):
+      gate.release()
+      continue
+    # No `await` occurs from the checks above to the start of the write.
+    gate.progress = Moment.now()
+    let write = mixProto.writeHopStream(pid, conn, frames, gate)
+    if not write.finished():
+      mixProto.hopWrites[conn] = write
+    return StartedWrite(conn: conn, write: write, run: run)
+
+proc completeHopWrite(
+    mixProto: MixProtocol, started: StartedWrite
+) {.async: (raises: [DialFailedError, CancelledError, LPStreamError]).} =
+  ## Wait for the write of `started`, and raise its error. A cancel stops only
+  ## this wait, and the write continues.
+  let write = started.write
+  await write.join()
+  if write.cancelled():
+    if not mixProto.started or mixProto.runId != started.run:
+      raise newException(MixStoppedError, "mix protocol stopped during the write")
+    # The protocol took the stream out of use. A live sender writes once more.
+    raise newLPStreamClosedError()
+  try:
+    write.read()
+  except FuturePendingError:
+    raiseAssert "join returned with the write still pending"
+
+proc writeFramesWithRetry(
+    mixProto: MixProtocol,
+    started: StartedWrite,
+    pid: PeerId,
+    addrs: seq[MultiAddress],
+    codecs: seq[string],
+    frames: seq[byte],
 ) {.async: (raises: [DialFailedError, LPStreamError, CancelledError]).} =
-  let c = await mixProto.getConn(pid, addrs, codecs)
-  await mixProto.writeLpWithRetry(c, pid, addrs, codecs, payload)
+  ## Wait for the write that `startHopWrite` started. If the stream of that
+  ## write ends, write `frames` one more time to a new stream. The retry runs in
+  ## the task of the caller. A cancel of the caller stops the retry, unless the
+  ## cancel comes at the moment the write ends.
+  try:
+    await mixProto.completeHopWrite(started)
+  except LPStreamEOFError:
+    let retry = await mixProto.startHopWrite(
+      pid, addrs, codecs, frames, failed = started.conn, run = Opt.some(started.run)
+    )
+    await mixProto.completeHopWrite(retry)
+
+proc writeFrames(
+    mixProto: MixProtocol,
+    pid: PeerId,
+    addrs: seq[MultiAddress],
+    codecs: seq[string],
+    frames: seq[byte],
+) {.async: (raises: [DialFailedError, LPStreamError, CancelledError]).} =
+  let started = await mixProto.startHopWrite(pid, addrs, codecs, frames)
+  await mixProto.writeFramesWithRetry(started, pid, addrs, codecs, frames)
 
 proc generateAndAppendProof(
     mixProto: MixProtocol,
@@ -815,16 +1070,22 @@ method handleMixMessages*(
       mixProto.refundUnwritten(claimEpoch)
       return
 
-    # A packet whose first dial failed or was cancelled never left this node, so
-    # its slot can be refunded and its messageId reused. After any write attempt the
-    # next hop may hold the proof, and reissuing the messageId in this epoch
-    # would be an RLN double-signal.
-    let conn =
+    let frames =
+      when defined(enable_mix_benchmarks):
+        lpFrame(metadataBytes) & lpFrame(outgoingPacket)
+      else:
+        lpFrame(outgoingPacket)
+
+    # A packet goes out of this node only after its write starts. If the dial or
+    # the wait for the stream stops before that, the slot of the packet goes
+    # back. Its messageId is then free for a new proof. After the write starts,
+    # the next hop can have the proof. A second proof with that messageId in
+    # this epoch is an RLN double-signal.
+    let started =
       try:
-        await mixProto.getConn(nextPeerId, @[nextAddr], @[MixProtocolID])
+        await mixProto.startHopWrite(nextPeerId, @[nextAddr], @[MixProtocolID], frames)
       except DialFailedError as exc:
-        # A dial that the stop ended is not a failure of the hop.
-        if mixProto.started:
+        if mixProto.failedTheHop(exc):
           error "Failed to dial next hop: ", err = exc.msg
           mix_messages_error.inc(labelValues = ["Intermediate", "DIAL_FAILED"])
         mixProto.refundUnwritten(claimEpoch, proofToken)
@@ -834,19 +1095,14 @@ method handleMixMessages*(
         raise e
 
     try:
-      when defined(enable_mix_benchmarks):
-        await mixProto.writeLpWithRetry(
-          conn, nextPeerId, @[nextAddr], @[MixProtocolID], metadataBytes
-        )
-      await mixProto.writeLpWithRetry(
-        conn, nextPeerId, @[nextAddr], @[MixProtocolID], outgoingPacket
+      await mixProto.writeFramesWithRetry(
+        started, nextPeerId, @[nextAddr], @[MixProtocolID], frames
       )
       mix_messages_forwarded.inc(labelValues = ["Intermediate"])
     except CancelledError as exc:
       raise exc
     except DialFailedError as exc:
-      # A dial that the stop ended is not a failure of the hop.
-      if mixProto.started:
+      if mixProto.failedTheHop(exc):
         error "Failed to dial next hop: ", err = exc.msg
         mix_messages_error.inc(labelValues = ["Intermediate", "DIAL_FAILED"])
     except LPStreamError as exc:
@@ -1192,16 +1448,22 @@ proc sendPacket(
   # This node did not select it.
   let ownFirstHop = logConfig.logType == Entry
 
-  # A packet whose first dial failed or was cancelled never left this node, so
-  # its messageId can be reused. After any write attempt the next hop may hold the
-  # proof: reissuing the messageId in this epoch would be an RLN double-signal,
-  # so the proof stays spent, including when a retry's redial fails.
-  let conn =
+  let frames =
+    when defined(enable_mix_benchmarks):
+      lpFrame(logConfig.metadata.serialize()) & lpFrame(packetToSend)
+    else:
+      lpFrame(packetToSend)
+
+  # A packet goes out of this node only after its write starts. If the dial or
+  # the wait for the stream stops before that, its messageId is free for a new
+  # proof. After the write starts, the next hop can have the proof. A second
+  # proof with that messageId in this epoch is an RLN double-signal. The proof
+  # then stays spent, also when the dial of a retry does not complete.
+  let started =
     try:
-      await mixProto.getConn(peerId, @[multiAddress], @[MixProtocolID])
+      await mixProto.startHopWrite(peerId, @[multiAddress], @[MixProtocolID], frames)
     except DialFailedError as exc:
-      # A dial that the stop ended is not a failure of the hop.
-      if mixProto.started:
+      if mixProto.failedTheHop(exc):
         mix_messages_error.inc(labelValues = [label, "SEND_FAILED"])
         if ownFirstHop:
           mixProto.backOffHop(peerId, exc)
@@ -1212,16 +1474,11 @@ proc sendPacket(
       raise e
 
   try:
-    when defined(enable_mix_benchmarks):
-      await mixProto.writeLpWithRetry(
-        conn, peerId, @[multiAddress], @[MixProtocolID], logConfig.metadata.serialize()
-      )
-    await mixProto.writeLpWithRetry(
-      conn, peerId, @[multiAddress], @[MixProtocolID], packetToSend
+    await mixProto.writeFramesWithRetry(
+      started, peerId, @[multiAddress], @[MixProtocolID], frames
     )
   except DialFailedError as exc:
-    # A dial that the stop ended is not a failure of the hop.
-    if mixProto.started:
+    if mixProto.failedTheHop(exc):
       mix_messages_error.inc(labelValues = [label, "SEND_FAILED"])
       if ownFirstHop:
         mixProto.backOffHop(peerId, exc)
@@ -1716,13 +1973,19 @@ proc generateAndAppendCoverProof(
 proc writeCoverPacket(
     mixProto: MixProtocol, peerId: PeerId, multiAddr: MultiAddress, packet: seq[byte]
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
+  # In benchmark mode the receiver reads a metadata frame before each packet. A
+  # cover packet has no origin time and no message ID, so its metadata is zero.
+  let frames =
+    when defined(enable_mix_benchmarks):
+      lpFrame(Metadata().serialize()) & lpFrame(packet)
+    else:
+      lpFrame(packet)
   try:
-    await mixProto.writeLp(peerId, @[multiAddr], @[MixProtocolID], packet)
+    await mixProto.writeFrames(peerId, @[multiAddr], @[MixProtocolID], frames)
     mix_messages_forwarded.inc(labelValues = ["Cover"])
     return ok()
   except DialFailedError as exc:
-    # A dial that the stop ended is not a failure of the hop.
-    if mixProto.started:
+    if mixProto.failedTheHop(exc):
       mix_messages_error.inc(labelValues = ["Cover", "SEND_FAILED"])
       mixProto.backOffHop(peerId, exc)
     return err("Failed to dial for cover packet: " & exc.msg)
@@ -1744,6 +2007,8 @@ proc sendCoverPacket*(
   return await mixProto.writeCoverPacket(peerId, multiAddr, proved.packet)
 
 method start*(mixProto: MixProtocol) {.async: (raises: [CancelledError]).} =
+  if not mixProto.started:
+    mixProto.runId.inc()
   await procCall LPProtocol(mixProto).start()
   if mixProto.keyRing.isSome():
     mixProto.keyRing.get().start()
@@ -1755,9 +2020,9 @@ method start*(mixProto: MixProtocol) {.async: (raises: [CancelledError]).} =
     await mixProto.coverTraffic.get().start()
 
 method stop*(mixProto: MixProtocol) {.async: (raises: []).} =
-  ## Stop the cover traffic, cancel the hop dials, the pending sends and the
-  ## in-flight handleMixMessages futures, close the hop streams, then stop the
-  ## `mix_pool_size` timer and the stores.
+  ## Stop the cover traffic, cancel the hop dials, the pending sends, the
+  ## in-flight handleMixMessages futures and the hop writes, close the hop
+  ## streams, then stop the `mix_pool_size` timer and the stores.
   if mixProto.coverTraffic.isSome:
     await mixProto.coverTraffic.get().stop()
   mixProto.started = false
@@ -1782,10 +2047,37 @@ method stop*(mixProto: MixProtocol) {.async: (raises: []).} =
   if pending.len > 0:
     await noCancel allFutures(pending.mapIt(it.cancelAndWait()))
 
+  # A hop write that the stop cancels can leave a part of a packet on its
+  # stream. The stop closes that stream below, so no packet follows that part.
+  var broken = mixProto.unusableStreams
+  for conn in mixProto.hopWrites.keys:
+    broken.incl(conn)
+  let writes = toSeq(mixProto.hopWrites.values)
+  if writes.len > 0:
+    await noCancel allFutures(writes.mapIt(it.cancelAndWait()))
+
+  # A stream that can hold a part of a packet gets a reset. A close of Yamux
+  # sends no FIN while the send queue of the stream holds data.
   let streams = toSeq(mixProto.connPool.values)
   mixProto.connPool.clear()
+  mixProto.unusableStreams.clear()
+  mixProto.hopGates.clear()
   if streams.len > 0:
-    await noCancel allFutures(streams.mapIt(it.close()))
+    await noCancel allFutures(
+      streams.mapIt(
+        if it in broken:
+          it.reset()
+        else:
+          it.close()
+      )
+    )
+
+  # A send that a cancel or the stop ended can leave the reset of its failed
+  # stream running.
+  let cleanups = toSeq(mixProto.hopCleanups.values)
+  mixProto.hopCleanups.clear()
+  if cleanups.len > 0:
+    await noCancel allFutures(cleanups)
 
   # A reader ends by itself only when the next hop closes its side of the stream.
   let readers = toSeq(mixProto.hopReaders.values)
